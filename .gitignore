@@ -5,3 +5,4 @@ output/
 sample.pdf
 dist
 build
+tools.egg-info
