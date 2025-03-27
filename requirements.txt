@@ -1,3 +1,5 @@
 pdf2image
 pillow
 questionary
+PyInstaller
+pypdf
