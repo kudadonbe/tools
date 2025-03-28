@@ -1,9 +1,9 @@
 
-# Kuda Tools - PDF & Image Utilities
+# kdm Tools - PDF & Image Utilities
 
 ## Setup Instructions
 
-Kuda Tools is a set of utilities for working with PDFs and images. It allows you to convert PDF pages to images and merge images into a single PDF.
+kdm Tools is a set of utilities for working with PDFs and images. It allows you to convert PDF pages to images and merge images into a single PDF.
 
 ### Requirements
 - Python 3.8 or higher
@@ -38,13 +38,13 @@ Kuda Tools is a set of utilities for working with PDFs and images. It allows you
 
 3. **Clone the repository**:
    ```bash
-   git clone https://github.com/kudadonbe/tools.git
+   git clone https://github.com/kdmdonbe/tools.git
    cd tools
    ```
 
 4. **Install dependencies**:
    ```bash
-   pip3 install --user -e .[dev]
+   pip3 install --user -e ".[dev]"
    ```
 
 5. **Set up the `PATH`**:
@@ -59,7 +59,7 @@ Kuda Tools is a set of utilities for working with PDFs and images. It allows you
 
 6. **Test the tool**:
    ```bash
-   kuda --help
+   kdm --help
    ```
 
 ---
@@ -85,32 +85,51 @@ Kuda Tools is a set of utilities for working with PDFs and images. It allows you
 
 3. **Clone the repository**:
    ```bash
-   git clone https://github.com/kudadonbe/tools.git
+   git clone https://github.com/kdmdonbe/tools.git
    cd tools
    ```
 
 4. **Install dependencies**:
    ```bash
-   pip install -e .[dev]
+   pip install -e ".[dev]"
    ```
 
 5. **Test the tool**:
    ```bash
-   kuda --help
+   kdm --help
    ```
 
 ---
 
+### 🛠️ Development Setup (Editable Mode)
+
+If you're working on the project locally (e.g. adding features), use this:
+```bash
+pip install --user -e ".[dev]"
+```
+
+If you encounter `ModuleNotFoundError: No module named 'tools'`, run:
+```bash
+export PYTHONPATH="$PYTHONPATH:$(pwd)"
+```
+This ensures Python can find the `tools` package in your current project directory.
+
+For convenience, you can add it to your `~/.zshrc` or `~/.bashrc`:
+```bash
+export PYTHONPATH="$PYTHONPATH:$HOME/Documents/GitHub/tools"
+```
+
+---
 ## Usage
 
 - **Convert PDF to images**:
   ```bash
-  kuda pdf2images
+  kdm pdf2images
   ```
 
 - **Merge images into PDF**:
   ```bash
-  kuda images2pdf
+  kdm images2pdf
   ```
 
 ---
@@ -119,17 +138,17 @@ Kuda Tools is a set of utilities for working with PDFs and images. It allows you
 
 1. Clone:
    ```bash
-   git clone https://github.com/kudadonbe/tools.git
+   git clone https://github.com/kdmdonbe/tools.git
    ```
 
 2. Install dependencies:
    ```bash
-   pip install -e .[dev]
+   pip install -e ".[dev]"
    ```
 
 3. Modify and run:
    ```bash
-   kuda pdf2images
+   kdm pdf2images
    ```
 
 4. Commit changes:
@@ -146,4 +165,4 @@ Kuda Tools is a set of utilities for working with PDFs and images. It allows you
 Ensure:
 - Poppler is installed and in `PATH`.
 - Python >=3.8.
-- Dependencies installed (`pip install --user -e .[dev]`).
+- Dependencies installed (`pip install --user -e ".[dev]"`).
