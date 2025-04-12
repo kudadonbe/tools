@@ -24,7 +24,13 @@ def get_pdf_files(folder: str) -> list[Path]:
 
 @click.command(name="mergepdfs")
 @click.argument("output_name", required=False)
-def merge_pdfs_command(output_name):
+@click.option(
+    "--sort",
+    type=click.Choice(["name", "date"]),
+    default="name",
+    help="Sort PDF files by name or date.",
+)
+def merge_pdfs_command(output_name, sort):
     """
     Merge all PDF files in a selected folder into one.
 
@@ -42,6 +48,8 @@ def merge_pdfs_command(output_name):
         return
 
     pdf_files = get_pdf_files(folder_path)
+    if sort == "date":
+        pdf_files.sort(key=lambda p: p.stat().st_mtime)
 
     if len(pdf_files) < 2:
         click.echo("⚠️ Need at least two PDF files in the folder.")
@@ -52,6 +60,8 @@ def merge_pdfs_command(output_name):
         final_name = output_name.strip()
     else:
         final_name = guess_output_name([str(p) for p in pdf_files])
+
+    click.echo(f"\n📝 Output file will be: {final_name}")
 
     # Ensure .pdf extension
     if not final_name.lower().endswith(".pdf"):
@@ -66,19 +76,22 @@ def merge_pdfs_command(output_name):
 
     # Merge PDFs
     writer = PdfWriter()
-    for file in pdf_files:
-        click.echo(f"➕ Adding: {file.name}")
-        with open(file, "rb") as f:
-            writer.append(f)
+    try:
+        for file in pdf_files:
+            click.echo(f"➕ Adding: {file.name}")
+            with open(file, "rb") as f:
+                writer.append(f)
+        with open(output_path, "wb") as out:
+            writer.write(out)
+        click.echo(f"\n✅ Merged PDF saved as: {output_path.resolve()}")
+    except Exception as e:
+        click.echo(f"❌ Error during merge: {e}")
 
-    with open(output_path, "wb") as out:
-        writer.write(out)
 
-
-    click.echo(f"\n✅ Merged PDF saved as: {output_path.resolve()}")
+# Allow calling from CLI via `mergepdfs.main()`
+def main():
+    merge_pdfs_command(prog_name="kdm merge")
 
 
 if __name__ == "__main__":
-    print("✅ mergepdfs.py script is being executed")
-    merge_pdfs_command()
-
+    main()

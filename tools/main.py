@@ -23,7 +23,7 @@ def main():
     elif args.command == 'images2pdf':
         images_to_pdf.main()
     elif args.command == 'merge':
-        mergepdfs.merge_pdfs_command()
+        mergepdfs.main()
     elif args.command == 'version':
         print("KDM Tools Version 1.0.0")
     elif args.command == 'help':
