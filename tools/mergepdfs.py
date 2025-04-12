@@ -79,6 +79,6 @@ def merge_pdfs_command(output_name):
 
 
 if __name__ == "__main__":
-    # print("✅ mergepdfs.py script is being executed")
+    print("✅ mergepdfs.py script is being executed")
     merge_pdfs_command()
 
