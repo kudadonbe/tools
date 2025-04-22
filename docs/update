@@ -1,8 +1,13 @@
-if ($PSVersionTable.Platform -ne 'Win32NT') {
-    throw "Unsupported platform: $($PSVersionTable.Platform)"
+function Start-KudaInstall {
+    $platform = $PSVersionTable.Platform
+    if ($platform -ne 'Win32NT') {
+        Write-Host "Detected platform: $platform"
+        Write-Host "This script only runs on Windows. Exiting..."
+        return
+    }
+
+    # Rest of your script logic here
+    Write-Host "✅ Hello from Kuda Tools installer!"
 }
 
- 
-
-
-Write-Host "✅ Hello from Kuda Tools installer!"
+Start-KudaInstall
