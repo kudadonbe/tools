@@ -1,0 +1,1 @@
+Write-Host "✅ Hello from Kuda Tools installer!"
