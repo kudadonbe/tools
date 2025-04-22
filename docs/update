@@ -1,1 +1,11 @@
+$platform = $PSVersionTable.Platform
+if ($platform -ne 'Win32NT') {
+    Write-Host "Detected platform: $platform"
+    Write-Host "This script only runs on Windows. Exiting..."
+    Write-Host "✅ Hello from Kuda Tools installer!"
+    exit
+}
+
+
+
 Write-Host "✅ Hello from Kuda Tools installer!"
