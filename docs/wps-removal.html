@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WPS Office Removal Guide</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      padding: 2rem;
+      background: #fefefe;
+    }
+    h1 {
+      color: #c0392b;
+    }
+    h2 {
+      margin-top: 2rem;
+      color: #2c3e50;
+    }
+    ol {
+      padding-left: 1.5rem;
+    }
+    code {
+      background: #f4f4f4;
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.95em;
+    }
+    .folders {
+      background: #f9f9f9;
+      padding: 0.75rem;
+      border-left: 4px solid #ccc;
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>WPS Office Complete Removal Guide</h1>
+  <p>This guide outlines the steps to fully uninstall WPS Office and remove user-specific data to ensure a clean reinstall.</p>
+
+  <h2>1. Uninstall WPS Office</h2>
+  <ol>
+    <li>Go to <strong>Settings &gt; Apps</strong> and uninstall all WPS Office components.</li>
+    <li>Alternatively, use <code>appwiz.cpl</code> (Run dialog) to open Programs & Features and uninstall from there.</li>
+  </ol>
+
+  <h2>2. Delete User Data Folders</h2>
+  <p>Delete the following folders for the affected user (replace <code>&lt;username&gt;</code> with the actual username):</p>
+  <div class="folders">
+    C:\Users\<code>&lt;username&gt;</code>\AppData\Local\Kingsoft<br>
+    C:\Users\<code>&lt;username&gt;</code>\AppData\Roaming\Kingsoft<br>
+    C:\Users\<code>&lt;username&gt;</code>\AppData\Local\WPS Office<br>
+    C:\Users\<code>&lt;username&gt;</code>\AppData\Roaming\WPS Office
+  </div>
+
+  <h2>3. Clean Up Registry</h2>
+  <ol>
+    <li>Open <code>regedit</code> (Windows + R → type <code>regedit</code>).</li>
+    <li>Navigate to the following registry paths and delete WPS or Kingsoft-related entries under the user's SID:
+      <ul>
+        <li><code>HKEY_USERS\S-1-5-21-...\Software\Kingsoft</code></li>
+        <li><code>HKEY_USERS\S-1-5-21-...\Software\WPSOffice</code></li>
+      </ul>
+    </li>
+    <li>Do not delete unrelated keys. Proceed with caution.</li>
+  </ol>
+
+  <h2>4. Reboot & Test</h2>
+  <p>After deletion, reboot the system. When the user logs in again, WPS will start with a fresh profile if reinstalled.</p>
+
+</body>
+</html>

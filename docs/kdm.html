@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>KDM CLI Tool – Kuda Tools</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      line-height: 1.6;
+      padding: 2rem;
+      background: #fefefe;
+    }
+    h1, h2 {
+      color: #2c3e50;
+    }
+    pre {
+      background: #f4f4f4;
+      padding: 1rem;
+      border-radius: 5px;
+      overflow-x: auto;
+    }
+    code {
+      background: #eee;
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+    }
+    ul, ol {
+      margin-left: 1.5rem;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>KDM CLI Tool</h1>
+  <p>A command-line utility for working with PDFs and images. Includes commands to convert PDF pages to images and merge images into a PDF.</p>
+
+  <h2>Requirements</h2>
+  <ul>
+    <li>Python 3.8 or higher</li>
+    <li>Poppler (for PDF to image conversion)</li>
+  </ul>
+
+  <h2>Installation</h2>
+
+  <h3>macOS & Linux</h3>
+  <ol>
+    <li>Install Python:
+      <pre><code>brew install python</code></pre>
+    </li>
+    <li>Install Poppler:
+      <pre><code>brew install poppler</code></pre>
+    </li>
+    <li>Clone the repo and install:
+      <pre><code>
+git clone https://github.com/kudadonbe/tools.git
+cd tools
+pip3 install --user -e .[dev]
+      </code></pre>
+    </li>
+  </ol>
+
+  <h3>Windows</h3>
+  <ol>
+    <li>Install Python from <a href="https://python.org" target="_blank">python.org</a>, check "Add Python to PATH".</li>
+    <li>Download and extract Poppler from GitHub, then add its <code>/bin</code> folder to PATH.</li>
+    <li>Clone and install:
+      <pre><code>
+git clone https://github.com/kudadonbe/tools.git
+cd tools
+pip install -e .[dev]
+      </code></pre>
+    </li>
+  </ol>
+
+  <h2>Usage</h2>
+  <p>Once installed, run:</p>
+  <pre><code>kdm --help</code></pre>
+  <p>Common commands:</p>
+  <ul>
+    <li><code>kdm pdf2images</code> – Convert PDF to image files.</li>
+    <li><code>kdm images2pdf</code> – Merge multiple images into a PDF.</li>
+  </ul>
+
+  <h2>Development</h2>
+  <ol>
+    <li>Modify source files directly after editable install (<code>pip install -e .[dev]</code>).</li>
+    <li>Use <code>kdm</code> commands to test.</li>
+    <li>Commit and push changes:
+      <pre><code>
+git add .
+git commit -m "Update"
+git push origin main
+      </code></pre>
+    </li>
+  </ol>
+
+</body>
+</html>
