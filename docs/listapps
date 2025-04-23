@@ -1,0 +1,15 @@
+
+function List-InstalledApps {
+    $paths = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    foreach ($path in $paths) {
+    Get-ItemProperty $path |
+        Where-Object { $_.DisplayName -ne $null } |
+        Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
+    }
+}
+
+List-InstalledApps | Sort-Object DisplayName | Format-Table -AutoSize
