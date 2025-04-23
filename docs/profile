@@ -1,0 +1,7 @@
+function runx($file) {
+    if (Test-Path $file) {
+        iex (Get-Content $file -Raw)
+    } else {
+        Write-Host "❌ File not found: $file"
+    }
+}
