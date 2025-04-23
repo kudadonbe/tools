@@ -50,7 +50,3 @@ When the domain user logs in next:
 - A fresh profile will be created
 - All WPS traces (installed and user-specific) will be gone
 - Group Policies and settings will reapply cleanly
-
----
-
-Let me know if you want this exported to a `.docx` or `.pdf`, or published to a page for internal sharing.
