@@ -34,39 +34,67 @@
   </style>
 </head>
 <body>
+  <main>
+    <h2>How to Completely Remove WPS Office and Reset a Domain User Profile in Windows</h2>
 
-  <h1>WPS Office Complete Removal Guide</h1>
-  <p>This guide outlines the steps to fully uninstall WPS Office and remove user-specific data to ensure a clean reinstall.</p>
+    <h3>Purpose:</h3>
+    <p>To ensure a full cleanup of WPS Office and reset a domain user’s Windows profile, restoring the system to a fresh, first-login state.</p>
 
-  <h2>1. Uninstall WPS Office</h2>
-  <ol>
-    <li>Go to <strong>Settings &gt; Apps</strong> and uninstall all WPS Office components.</li>
-    <li>Alternatively, use <code>appwiz.cpl</code> (Run dialog) to open Programs & Features and uninstall from there.</li>
-  </ol>
+    <hr>
 
-  <h2>2. Delete User Data Folders</h2>
-  <p>Delete the following folders for the affected user (replace <code>&lt;username&gt;</code> with the actual username):</p>
-  <div class="folders">
-    C:\Users\<code>&lt;username&gt;</code>\AppData\Local\Kingsoft<br>
-    C:\Users\<code>&lt;username&gt;</code>\AppData\Roaming\Kingsoft<br>
-    C:\Users\<code>&lt;username&gt;</code>\AppData\Local\WPS Office<br>
-    C:\Users\<code>&lt;username&gt;</code>\AppData\Roaming\WPS Office
-  </div>
+    <h3>PART 1: Uninstall WPS Office</h3>
 
-  <h2>3. Clean Up Registry</h2>
-  <ol>
-    <li>Open <code>regedit</code> (Windows + R → type <code>regedit</code>).</li>
-    <li>Navigate to the following registry paths and delete WPS or Kingsoft-related entries under the user's SID:
-      <ul>
-        <li><code>HKEY_USERS\S-1-5-21-...\Software\Kingsoft</code></li>
-        <li><code>HKEY_USERS\S-1-5-21-...\Software\WPSOffice</code></li>
-      </ul>
-    </li>
-    <li>Do not delete unrelated keys. Proceed with caution.</li>
-  </ol>
+    <h4>1. Uninstall via Settings</h4>
+    <ul>
+      <li>Go to: <strong>Settings > Apps > Installed Apps</strong></li>
+      <li>Search <strong>WPS Office</strong></li>
+      <li>Click <strong>Uninstall</strong></li>
+    </ul>
 
-  <h2>4. Reboot & Test</h2>
-  <p>After deletion, reboot the system.</p>
+    <h4>2. Manually Delete Remaining Program Folders</h4>
+    <p>Remove these if they still exist:</p>
+    <ul>
+      <li>C:\Program Files\Kingsoft</li>
+      <li>C:\Program Files (x86)\Kingsoft</li>
+      <li>C:\ProgramData\Kingsoft</li>
+      <li>C:\ProgramData\WPS Office</li>
+    </ul>
 
+    <h4>3. Clean WPS Registry Entries (System-Wide)</h4>
+    <p>Open <strong>Regedit</strong> (Win + R → <code>regedit</code>) and delete:</p>
+    <ul>
+      <li>HKEY_LOCAL_MACHINE\SOFTWARE\Kingsoft</li>
+      <li>HKEY_LOCAL_MACHINE\SOFTWARE\WPS Office</li>
+      <li><em>(Optional)</em> HKEY_CURRENT_USER\Software\Kingsoft — only needed if not resetting the user profile</li>
+    </ul>
+
+    <hr>
+
+    <h3>PART 2: Reset the Domain User Profile</h3>
+
+    <h4>1. Log in as a different Administrator</h4>
+
+    <h4>2. Delete User Folder</h4>
+    <ul>
+      <li>Path: <code>C:\Users\&lt;username&gt;</code></li>
+      <li>Delete the folder entirely</li>
+    </ul>
+
+    <h4>3. Remove Registry Profile Key</h4>
+    <ul>
+      <li>Go to: <pre>HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList</pre></li>
+      <li>Find the SID with <code>ProfileImagePath</code> matching the deleted user (e.g., <code>C:\Users\ali.ibrahim</code>)</li>
+      <li><strong>Right-click the SID key</strong> and <strong>Delete</strong> it</li>
+    </ul>
+
+    <hr>
+
+    <h3>Result</h3>
+    <ul>
+      <li>A fresh profile will be created on next login</li>
+      <li>All WPS traces (installed and user-specific) will be gone</li>
+      <li>Group Policies and settings will reapply cleanly</li>
+    </ul>
+  </main>
 </body>
 </html>
