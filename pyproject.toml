@@ -1,3 +1,13 @@
+# ---------------------------------------------
+# pyproject.toml - Project Metadata & Configuration
+#
+# Defines project metadata, dependencies, and packaging configurations
+# for the KDM Tools project.
+#
+# Author: Hussain Shareef (@kudadonbe)
+# Date: 2025-03-26
+# ---------------------------------------------
+
 [project]
 name = "tools"
 version = "0.1.0"
@@ -11,9 +21,17 @@ authors = [
 ]
 
 dependencies = [
+  "firebase-admin",
+  "python-dotenv",
   "pdf2image",
   "pillow",
+  "pytesseract",
+  "ocrmypdf",
+  "pikepdf",
   "questionary",
+  "click",
+  "tqdm",
+  "numpy",
   "pypdf"
 ]
 
@@ -25,9 +43,9 @@ dev = [
   "ruff"
 ]
 
+[project.scripts]
+kdm = "tools.main:main"
+
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
-
-[project.scripts]
-kdm = "tools.main:main"

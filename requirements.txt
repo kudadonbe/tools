@@ -1,10 +1,54 @@
+# ---------------------------------------------
+# requirements.txt - Project Python Dependencies
+#
+# Defines required Python libraries for the KDM Tools project.
+# Used by pip to install project dependencies.
+#
+# Author: Hussain Shareef (@kudadonbe)
+# Date: 2025-03-26
+# ---------------------------------------------
+
+# ---------------------------------------------------
+# Firebase & Environment Configuration
+# ---------------------------------------------------
+
+# Firebase Admin SDK for Python (Firestore integration)
+firebase-admin
+
+# Load environment variables from .env files
+python-dotenv
+
+# ---------------------------------------------------
+# PDF, OCR, and Image Processing
+# ---------------------------------------------------
+
+# Convert PDF pages to images
 pdf2image
+
+# Image handling
 pillow
-questionary
-pypdf
-click
-opencv-python
-numpy
+
+# OCR support
 pytesseract
 ocrmypdf
 pikepdf
+
+# ---------------------------------------------------
+# CLI & Interaction Utilities
+# ---------------------------------------------------
+
+# Interactive prompts in terminal
+questionary
+
+# Command-line interface support
+click
+
+# Progress bar for CLI
+tqdm
+
+# ---------------------------------------------------
+# Other utilities
+# ---------------------------------------------------
+
+# Numerical processing (used internally by some image tools)
+numpy
