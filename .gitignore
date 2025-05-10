@@ -18,6 +18,7 @@ __pycache__/
 # Build and Distribution Artifacts
 # ---------------------------------------------------
 output/
+data/
 *.png
 sample.pdf
 dist/
