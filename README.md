@@ -68,26 +68,65 @@
    - Extract and place in a permanent folder (e.g., `C:\Tools\poppler`)
    - Add `C:\Tools\poppler\Library\bin` to your system `PATH`
 
-3. **Clone and install**:
+4. **Clone and install**:
     ```bash
     git clone https://github.com/kdmdonbe/tools.git
     cd tools
     pip install --user -e ".[dev]"
     ```
 
-4. **(Optional but recommended)**: Add the scripts path to your PATH:
-    ```
-    %USERPROFILE%\AppData\Roaming\Python\Python3xx\Scripts\
-    ```
-    > This lets you run `kdm` globally in PowerShell or CMD. You can still run it locally using `.\kdm` even without adding to PATH.
+4. **(Optional but recommended)**: Add the per-user Python Scripts folder to your `PATH` so installed entry points (like `kdm`) are runnable from any shell.
+
+        You can compute the exact Scripts folder for your Python installation from PowerShell and add it permanently to your User PATH. Example commands (PowerShell):
+
+        ```powershell
+        # show the per-user base (e.g. C:\Users\you\AppData\Roaming\Python)
+        python -m site --user-base
+
+        # compute the Scripts path automatically (prints the final folder)
+        $base = (python -m site --user-base).Trim();
+        $pyver = python -c "import sys; print('Python{}{}'.format(sys.version_info.major, sys.version_info.minor))";
+        $scriptsPath = Join-Path (Join-Path $base $pyver) 'Scripts';
+        Write-Output $scriptsPath
+        ```
+
+        Example output: `C:\Users\yourname\AppData\Roaming\Python\Python39\Scripts`
+
+        To add that folder to your User PATH (permanent):
+
+        ```powershell
+        $userPath = [Environment]::GetEnvironmentVariable('PATH','User')
+        if ($userPath -notlike "*$scriptsPath*") {
+            [Environment]::SetEnvironmentVariable('PATH', "$userPath;$scriptsPath", 'User')
+            Write-Output "Added to User PATH. Restart your shell or sign out/in to apply." 
+        } else {
+            Write-Output "Scripts path already present in User PATH."
+        }
+        ```
+
+        > This lets you run `kdm` globally in PowerShell or CMD. You can still run it locally using `./kdm` even without adding to PATH.
 
 5. **Set PYTHONPATH if needed**:
-    ```powershell
-    $env:PYTHONPATH = "$(Get-Location)"
-    ```
-    Or add it permanently in **Environment Variables** → User variables:
-    - **Name**: `PYTHONPATH`
-    - **Value**: `Full\Path\To\tools` (e.g. `C:\Users\yourname\Documents\GitHub\tools`)
+
+        If you see `ModuleNotFoundError: No module named 'tools'` while working in the repo, it's often because Python's import search path doesn't include the repository root. Two recommended fixes:
+
+        - Preferred: install the package in editable mode (above) so imports and console scripts work without tweaking PYTHONPATH:
+
+            ```powershell
+            python -m pip install --user -e ".[dev]"
+            ```
+
+        - Quick/dev-only: set `PYTHONPATH` to the repository root (not to the nested `tools` folder):
+
+            ```powershell
+            # temporary (current session only)
+            $env:PYTHONPATH = "C:\Users\developer\OneDrive\Documents\GitHub\tools"
+
+            # permanent (User environment variable)
+            [Environment]::SetEnvironmentVariable('PYTHONPATH', 'C:\Users\developer\OneDrive\Documents\GitHub\tools', 'User')
+            ```
+
+        Important: set `PYTHONPATH` to the repository root (for example `C:\Users\...\GitHub\tools`) and NOT to the nested `...\tools\tools` directory. Pointing at `...\tools\tools` will make Python look for `...\tools\tools\tools` when you `import tools`, which is incorrect and the most common source of confusion.
 
 6. **Test**:
     ```powershell
