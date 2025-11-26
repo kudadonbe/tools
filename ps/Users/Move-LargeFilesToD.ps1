@@ -39,6 +39,9 @@ param(
     [switch]$WhatIf
 )
 
+# Import shared utilities
+Import-Module "$PSScriptRoot\UserFilesUtils.psm1" -Force
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -63,109 +66,6 @@ Write-Host ""
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "$PSScriptRoot\MoveLog_$timestamp.txt"
 
-# System and program folders to exclude (protect all application data)
-# 
-# Files that WILL be moved (user content):
-#   - Documents, Downloads, Videos, Pictures, Desktop
-#   - Teams meeting recordings (Videos/Recordings or Downloads)
-#   - Large media files, installers, ISOs, backups
-#   - Any user-created content outside excluded folders
-#
-# Files that will NOT be moved (protected):
-$excludeFolders = @(
-    # Application data (critical - DO NOT MOVE)
-    'AppData',              # All application settings and data
-    'Application Data',     # Legacy app data symlink
-    'Local Settings',       # Legacy local settings
-    
-    # Development tools (packages and caches)
-    '.nuget',               # NuGet packages
-    '.vscode',              # VS Code settings
-    '.android',             # Android SDK
-    '.gradle',              # Gradle cache
-    '.docker',              # Docker data
-    '.m2',                  # Maven repository
-    '.npm',                 # NPM cache
-    '.cargo',               # Rust packages
-    'node_modules',         # Node.js packages
-    'venv',                 # Python virtual environments
-    'env',                  # Python virtual environments
-    '.virtualenv',          # Python virtual environments
-    
-    # Cloud sync folders (already backed up)
-    'OneDrive',             # OneDrive sync
-    'Dropbox',              # Dropbox sync
-    'Google Drive',         # Google Drive sync
-    'iCloudDrive',          # iCloud sync
-    
-    # Windows system folders
-    'Saved Games',          # Game saves
-    'Searches',             # Saved searches
-    'Links',                # Quick access links
-    'Contacts',             # Windows contacts
-    'Favorites',            # Browser favorites
-    'Cookies',              # Browser cookies
-    'NetHood',              # Network shortcuts
-    'PrintHood',            # Printer shortcuts
-    'Recent',               # Recent files list
-    'SendTo',               # Send to menu items
-    'Start Menu',           # Start menu shortcuts
-    'Templates',            # Document templates
-    
-    # Browser profiles (contain settings and extensions)
-    '.mozilla',             # Firefox
-    '.chrome',              # Chrome
-    'Chrome',               # Chrome user data
-    'Firefox',              # Firefox user data
-    'Edge',                 # Edge user data
-    
-    # Program-specific folders
-    '.ssh',                 # SSH keys (security sensitive)
-    '.gnupg',               # GPG keys (security sensitive)
-    '.aws',                 # AWS credentials (security sensitive)
-    '.kube',                # Kubernetes config (security sensitive)
-    'workspace',            # IDE workspaces
-    '.idea',                # IntelliJ settings
-    '.eclipse',             # Eclipse settings
-    
-    # Game launchers
-    'Steam',                # Steam (program files)
-    'Epic Games',           # Epic Games launcher
-    'Battle.net',           # Blizzard launcher
-    
-    # System cache
-    'Temp',                 # Temporary files
-    'tmp',                  # Temporary files
-    'cache',                # General cache
-    'Cache'                 # General cache
-)
-
-# ============================================================================
-# FUNCTIONS
-# ============================================================================
-
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $logMessage = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
-    Add-Content -Path $logFile -Value $logMessage
-    
-    switch ($Level) {
-        "ERROR"   { Write-Host $Message -ForegroundColor Red }
-        "SUCCESS" { Write-Host $Message -ForegroundColor Green }
-        "WARNING" { Write-Host $Message -ForegroundColor Yellow }
-        default   { Write-Host $Message }
-    }
-}
-
-function Get-FileHashQuick {
-    param([string]$Path)
-    try {
-        return (Get-FileHash -Path $Path -Algorithm SHA256).Hash
-    } catch {
-        return $null
-    }
-}
-
 # ============================================================================
 # INITIALIZATION
 # ============================================================================
@@ -179,15 +79,37 @@ if ($WhatIf) {
     Write-Host ""
 }
 
-Write-Log "Starting migration process (MinSize: ${minSizeMB}MB, WhatIf: $WhatIf)"
+Write-FileLog -Message "Starting migration process (MinSize: ${minSizeMB}MB, WhatIf: $WhatIf)" -Level 'INFO' -LogPath $logFile
 
 # Check if D: drive exists
 if (-not (Test-Path "D:\")) {
-    Write-Log "ERROR: D: drive not found. Cannot proceed." "ERROR"
+    Write-Host "ERROR: D: drive not found. Cannot proceed." -ForegroundColor Red
+    Write-FileLog -Message "ERROR: D: drive not found" -Level 'ERROR' -LogPath $logFile
     exit 1
 }
 
-# Initialize counters
+# ============================================================================
+# SCAN FILES
+# ============================================================================
+
+Write-Host "Scanning for large files..." -ForegroundColor Yellow
+Write-Host ""
+
+$scanData = Scan-LargeUserFiles -MinSizeMB $minSizeMB -Verbose
+
+if ($scanData.TotalFiles -eq 0) {
+    Write-Host "No files found larger than ${minSizeMB}MB" -ForegroundColor Yellow
+    exit 0
+}
+
+Write-Host ""
+Write-Host "Found $($scanData.TotalFiles) files to process" -ForegroundColor Green
+Write-Host ""
+
+# ============================================================================
+# MIGRATE FILES
+# ============================================================================
+
 $stats = @{
     TotalFiles = 0
     CopiedFiles = 0
@@ -196,102 +118,61 @@ $stats = @{
     TotalBytesMoved = 0
 }
 
-# ============================================================================
-# SCAN AND MOVE FILES
-# ============================================================================
-
-# Get all user folders
-$userFolders = Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue | 
-    Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') }
-
-foreach ($userFolder in $userFolders) {
-    Write-Host ""
-    Write-Host "Processing user: $($userFolder.Name)..." -ForegroundColor Cyan
-    Write-Log "Scanning user: $($userFolder.Name)"
+foreach ($user in $scanData.Results.Keys) {
+    Write-Host "Processing user: $user..." -ForegroundColor Cyan
+    Write-FileLog -Message "Scanning user: $user" -Level 'INFO' -LogPath $logFile
     
-    try {
-        # Find large files
-        $files = Get-ChildItem -Path $userFolder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object {
-                if ($_.Length -lt ($minSizeMB * 1MB)) { return $false }
-                
-                $inExcludedFolder = $false
-                foreach ($exclude in $excludeFolders) {
-                    if ($_.FullName -match "\\$exclude\\") {
-                        $inExcludedFolder = $true
-                        break
-                    }
-                }
-                return (-not $inExcludedFolder)
-            }
+    foreach ($file in $scanData.Results[$user]) {
+        $stats.TotalFiles++
         
-        # Process each file
-        foreach ($file in $files) {
-            $stats.TotalFiles++
-            
-            # Calculate destination path (C:\Users\username\... → D:\Users\username\...)
-            $relativePath = $file.FullName.Replace("C:\Users\", "")
-            $destPath = "D:\Users\$relativePath"
-            $destDir = Split-Path -Path $destPath -Parent
-            
-            $fileSizeMB = [math]::Round($file.Length / 1MB, 2)
-            Write-Host "  Found: $($file.FullName) ($fileSizeMB MB)" -ForegroundColor Gray
-            
-            if ($WhatIf) {
-                Write-Host "    → Would move to: $destPath" -ForegroundColor DarkGray
-                Write-Log "WHATIF: Would move $($file.FullName) to $destPath"
-                continue
-            }
-            
-            try {
-                # Create destination directory if needed
-                if (-not (Test-Path $destDir)) {
-                    New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-                    Write-Log "Created directory: $destDir"
-                }
-                
-                # Copy file (NOT move - safer for locked files)
-                Write-Host "    Copying to D: drive..." -ForegroundColor Yellow
-                Copy-Item -Path $file.FullName -Destination $destPath -Force -ErrorAction Stop
-                
-                # Verify copy with hash comparison
-                Write-Host "    Verifying copy..." -ForegroundColor Yellow
-                $sourceHash = Get-FileHashQuick -Path $file.FullName
-                $destHash = Get-FileHashQuick -Path $destPath
-                
-                if ($sourceHash -and $destHash -and ($sourceHash -eq $destHash)) {
-                    # Verification successful - safely delete original
-                    Write-Host "    ✓ Verified! Deleting from C: drive..." -ForegroundColor Green
-                    
-                    # Attempt to delete (may fail if file is locked - that's OK)
-                    try {
-                        Remove-Item -Path $file.FullName -Force -ErrorAction Stop
-                        $stats.DeletedFiles++
-                        Write-Log "SUCCESS: Moved $($file.FullName) → $destPath ($fileSizeMB MB)" "SUCCESS"
-                    } catch {
-                        Write-Host "    ⚠ Could not delete (file may be locked). Copy successful, original kept." -ForegroundColor Yellow
-                        Write-Log "WARNING: Copied but could not delete $($file.FullName): $($_.Exception.Message)" "WARNING"
-                    }
-                    
-                    $stats.CopiedFiles++
-                    $stats.TotalBytesMoved += $file.Length
-                } else {
-                    # Verification failed - keep original
-                    Write-Host "    ✗ Hash mismatch! Keeping original file." -ForegroundColor Red
-                    Remove-Item -Path $destPath -Force -ErrorAction SilentlyContinue
-                    $stats.FailedFiles++
-                    Write-Log "ERROR: Hash verification failed for $($file.FullName)" "ERROR"
-                }
-                
-            } catch {
-                $stats.FailedFiles++
-                Write-Log "ERROR: Failed to move $($file.FullName): $($_.Exception.Message)" "ERROR"
-            }
+        # Calculate destination path
+        $relativePath = $file.FullPath.Replace("C:\Users\", "")
+        $destPath = "D:\Users\$relativePath"
+        
+        $fileSizeMB = $file.SizeMB
+        Write-Host "  Found: $($file.FullPath) ($fileSizeMB MB)" -ForegroundColor Gray
+        
+        if ($WhatIf) {
+            Write-Host "    → Would move to: $destPath" -ForegroundColor DarkGray
+            Write-FileLog -Message "WHATIF: Would move $($file.FullPath) to $destPath" -Level 'INFO' -LogPath $logFile
+            continue
         }
         
-    } catch {
-        Write-Log "ERROR: Failed to scan $($userFolder.Name): $($_.Exception.Message)" "ERROR"
+        try {
+            # Copy file with verification
+            Write-Host "    Copying to D: drive..." -ForegroundColor Yellow
+            $copySuccess = Copy-FileWithVerification -SourcePath $file.FullPath -DestinationPath $destPath
+            
+            if ($copySuccess) {
+                Write-Host "    ✓ Copy verified!" -ForegroundColor Green
+                
+                # Attempt to delete (may fail if locked)
+                try {
+                    Write-Host "    Deleting from C: drive..." -ForegroundColor Yellow
+                    Remove-Item -Path $file.FullPath -Force -ErrorAction Stop
+                    $stats.DeletedFiles++
+                    Write-Host "    ✓ Migrated successfully" -ForegroundColor Green
+                    Write-FileLog -Message "SUCCESS: Moved $($file.FullPath) → $destPath ($fileSizeMB MB)" -Level 'SUCCESS' -LogPath $logFile
+                } catch {
+                    Write-Host "    ⚠ Could not delete (file may be locked). Copy successful, original kept." -ForegroundColor Yellow
+                    Write-FileLog -Message "WARNING: Copied but could not delete $($file.FullPath): $($_.Exception.Message)" -Level 'WARNING' -LogPath $logFile
+                }
+                
+                $stats.CopiedFiles++
+                $stats.TotalBytesMoved += ($fileSizeMB * 1MB)
+            } else {
+                Write-Host "    ✗ Hash mismatch! Keeping original file." -ForegroundColor Red
+                $stats.FailedFiles++
+                Write-FileLog -Message "ERROR: Hash verification failed for $($file.FullPath)" -Level 'ERROR' -LogPath $logFile
+            }
+            
+        } catch {
+            $stats.FailedFiles++
+            Write-Host "    ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+            Write-FileLog -Message "ERROR: Failed to move $($file.FullPath): $($_.Exception.Message)" -Level 'ERROR' -LogPath $logFile
+        }
     }
+    Write-Host ""
 }
 
 # ============================================================================
@@ -317,7 +198,7 @@ Log file: $logFile
 "@
 
 Write-Host $summary
-Write-Log $summary
+Write-FileLog -Message $summary -Level 'INFO' -LogPath $logFile
 
 Write-Host ""
 Write-Host "=" * 80 -ForegroundColor Green

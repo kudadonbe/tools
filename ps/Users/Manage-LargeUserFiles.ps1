@@ -22,6 +22,9 @@
     - MoveLog_[timestamp].txt - Migration log (if files moved)
 #>
 
+# Import shared utilities
+Import-Module "$PSScriptRoot\UserFilesUtils.psm1" -Force
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -30,41 +33,8 @@ $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $reportFile = "$PSScriptRoot\LargeUserFiles_$timestamp.txt"
 $logFile = "$PSScriptRoot\MoveLog_$timestamp.txt"
 
-# System and program folders to exclude
-$excludeFolders = @(
-    # Application data (critical - DO NOT MOVE)
-    'AppData', 'Application Data', 'Local Settings',
-    
-    # Development tools
-    '.nuget', '.vscode', '.android', '.gradle', '.docker', '.m2', '.npm', 
-    '.cargo', 'node_modules', 'venv', 'env', '.virtualenv',
-    
-    # Cloud sync folders
-    'OneDrive', 'Dropbox', 'Google Drive', 'iCloudDrive',
-    
-    # Windows system folders
-    'Saved Games', 'Searches', 'Links', 'Contacts', 'Favorites', 
-    'Cookies', 'NetHood', 'PrintHood', 'Recent', 'SendTo', 
-    'Start Menu', 'Templates',
-    
-    # Browser profiles
-    '.mozilla', '.chrome', 'Chrome', 'Firefox', 'Edge',
-    
-    # Security sensitive
-    '.ssh', '.gnupg', '.aws', '.kube',
-    
-    # IDE settings
-    'workspace', '.idea', '.eclipse',
-    
-    # Game launchers
-    'Steam', 'Epic Games', 'Battle.net',
-    
-    # System cache
-    'Temp', 'tmp', 'cache', 'Cache'
-)
-
 # ============================================================================
-# FUNCTIONS
+# UI FUNCTIONS
 # ============================================================================
 
 function Show-Header {
@@ -99,116 +69,38 @@ function Get-MinimumSize {
     return [int]$input
 }
 
-function Scan-LargeFiles {
-    param([int]$MinSizeMB)
+# ============================================================================
+# WORKFLOW FUNCTIONS
+# ============================================================================
+
+function Invoke-ScanWorkflow {
+    param([int]$MinSize)
     
     Write-Host ""
-    Write-Host "  Scanning C:\Users for files larger than ${MinSizeMB}MB..." -ForegroundColor Yellow
+    Write-Host "  Scanning C:\Users for files larger than ${MinSize}MB..." -ForegroundColor Yellow
     Write-Host "  This may take a few minutes..." -ForegroundColor DarkGray
     Write-Host ""
     
-    $results = @{}
-    $totalFiles = 0
-    
-    $userFolders = Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue | 
-        Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') }
-    
-    foreach ($userFolder in $userFolders) {
-        Write-Host "  Scanning: $($userFolder.Name)..." -ForegroundColor Cyan
-        
-        try {
-            $files = Get-ChildItem -Path $userFolder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue |
-                Where-Object {
-                    if ($_.Length -lt ($MinSizeMB * 1MB)) { return $false }
-                    
-                    $inExcludedFolder = $false
-                    foreach ($exclude in $excludeFolders) {
-                        if ($_.FullName -match "\\$exclude\\") {
-                            $inExcludedFolder = $true
-                            break
-                        }
-                    }
-                    return (-not $inExcludedFolder)
-                }
-            
-            $userFiles = @()
-            foreach ($file in $files) {
-                $totalFiles++
-                $relativePath = $file.FullName.Replace($userFolder.FullName, "~").Replace('\', '/')
-                
-                $userFiles += [PSCustomObject]@{
-                    Path = $relativePath
-                    SizeMB = [math]::Round($file.Length / 1MB, 2)
-                    FullPath = $file.FullName
-                }
-            }
-            
-            if ($userFiles.Count -gt 0) {
-                $results[$userFolder.Name] = $userFiles | Sort-Object -Property SizeMB -Descending
-            }
-            
-        } catch {
-            Write-Host "  Error scanning $($userFolder.Name): $($_.Exception.Message)" -ForegroundColor Red
-        }
-    }
-    
-    return @{
-        Results = $results
-        TotalFiles = $totalFiles
-    }
-}
-
-function Generate-Report {
-    param($ScanData, [int]$MinSizeMB)
-    
-    $report = @()
-    $report += "=" * 80
-    $report += "LARGE FILES REPORT (Files > ${MinSizeMB}MB)"
-    $report += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    $report += "Total files found: $($ScanData.TotalFiles)"
-    $report += "=" * 80
-    $report += ""
-    
-    foreach ($user in $ScanData.Results.Keys | Sort-Object) {
-        $report += ""
-        $report += "$user (Users/$user)"
-        $report += "-" * 80
-        
-        foreach ($file in $ScanData.Results[$user]) {
-            $report += "$($file.Path.PadRight(70)) | $($file.SizeMB) MB"
-        }
-        
-        $totalSize = ($ScanData.Results[$user] | Measure-Object -Property SizeMB -Sum).Sum
-        $report += ""
-        $report += "Subtotal: $($ScanData.Results[$user].Count) files, $([math]::Round($totalSize, 2)) MB"
-        $report += ""
-    }
-    
-    $report | Out-File -FilePath $reportFile -Encoding UTF8
+    $scanData = Scan-LargeUserFiles -MinSizeMB $MinSize -Verbose
     
     Write-Host ""
-    Write-Host ("=" * 80) -ForegroundColor Green
-    Write-Host "  Report saved to: $reportFile" -ForegroundColor Green
-    Write-Host ("=" * 80) -ForegroundColor Green
-    Write-Host ""
-}
-
-function Get-FileHashQuick {
-    param([string]$Path)
-    try {
-        return (Get-FileHash -Path $Path -Algorithm SHA256).Hash
-    } catch {
-        return $null
+    if ($scanData.TotalFiles -eq 0) {
+        Write-Host "  No files found larger than ${MinSize}MB" -ForegroundColor Yellow
+    } else {
+        New-LargeFilesReport -ScanData $scanData -MinSizeMB $MinSize -OutputPath $reportFile
+        
+        Write-Host ""
+        Write-Host ("=" * 80) -ForegroundColor Green
+        Write-Host "  Report saved to: $reportFile" -ForegroundColor Green
+        Write-Host ("=" * 80) -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  Found $($scanData.TotalFiles) large files" -ForegroundColor Green
     }
+    
+    return $scanData
 }
 
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $logMessage = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
-    Add-Content -Path $logFile -Value $logMessage
-}
-
-function Move-FilesToD {
+function Invoke-MigrationWorkflow {
     param($ScanData)
     
     Write-Host ""
@@ -240,7 +132,7 @@ function Move-FilesToD {
         return
     }
     
-    Write-Log "Starting migration to D: drive"
+    Write-FileLog -Message "Starting migration to D: drive" -Level 'INFO' -LogPath $logFile
     
     $stats = @{
         TotalFiles = 0
@@ -263,50 +155,39 @@ function Move-FilesToD {
             $sourcePath = $file.FullPath
             $relativePath = $sourcePath.Replace("C:\Users\", "")
             $destPath = "D:\Users\$relativePath"
-            $destDir = Split-Path -Path $destPath -Parent
             
             Write-Host "    Processing: $($file.Path) ($($file.SizeMB) MB)" -ForegroundColor Gray
             
             try {
-                # Create destination directory
-                if (-not (Test-Path $destDir)) {
-                    New-Item -Path $destDir -ItemType Directory -Force | Out-Null
-                }
-                
-                # Copy file
+                # Copy with verification
                 Write-Host "      → Copying..." -ForegroundColor DarkGray
-                Copy-Item -Path $sourcePath -Destination $destPath -Force -ErrorAction Stop
+                $copySuccess = Copy-FileWithVerification -SourcePath $sourcePath -DestinationPath $destPath
                 
-                # Verify
-                Write-Host "      → Verifying..." -ForegroundColor DarkGray
-                $sourceHash = Get-FileHashQuick -Path $sourcePath
-                $destHash = Get-FileHashQuick -Path $destPath
-                
-                if ($sourceHash -and $destHash -and ($sourceHash -eq $destHash)) {
+                if ($copySuccess) {
                     # Try to delete
+                    Write-Host "      → Verifying..." -ForegroundColor DarkGray
                     try {
                         Remove-Item -Path $sourcePath -Force -ErrorAction Stop
                         $stats.DeletedFiles++
                         Write-Host "      ✓ Migrated successfully" -ForegroundColor Green
-                        Write-Log "SUCCESS: Moved $sourcePath → $destPath ($($file.SizeMB) MB)" "SUCCESS"
+                        Write-FileLog -Message "SUCCESS: Moved $sourcePath → $destPath ($($file.SizeMB) MB)" -Level 'SUCCESS' -LogPath $logFile
                     } catch {
                         Write-Host "      ⚠ Copied but file is locked (kept on C:)" -ForegroundColor Yellow
-                        Write-Log "WARNING: Copied but locked: $sourcePath" "WARNING"
+                        Write-FileLog -Message "WARNING: Copied but locked: $sourcePath" -Level 'WARNING' -LogPath $logFile
                     }
                     
                     $stats.CopiedFiles++
                     $stats.TotalBytesMoved += ($file.SizeMB * 1MB)
                 } else {
                     Write-Host "      ✗ Verification failed!" -ForegroundColor Red
-                    Remove-Item -Path $destPath -Force -ErrorAction SilentlyContinue
                     $stats.FailedFiles++
-                    Write-Log "ERROR: Hash mismatch for $sourcePath" "ERROR"
+                    Write-FileLog -Message "ERROR: Hash mismatch for $sourcePath" -Level 'ERROR' -LogPath $logFile
                 }
                 
             } catch {
                 $stats.FailedFiles++
                 Write-Host "      ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
-                Write-Log "ERROR: $sourcePath - $($_.Exception.Message)" "ERROR"
+                Write-FileLog -Message "ERROR: $sourcePath - $($_.Exception.Message)" -Level 'ERROR' -LogPath $logFile
             }
         }
         Write-Host ""
@@ -356,16 +237,9 @@ switch ($choice) {
     "1" {
         Show-Header "SCAN AND REPORT"
         $minSize = Get-MinimumSize
-        $scanData = Scan-LargeFiles -MinSizeMB $minSize
+        $scanData = Invoke-ScanWorkflow -MinSize $minSize
         
-        if ($scanData.TotalFiles -eq 0) {
-            Write-Host ""
-            Write-Host "  No files found larger than ${minSize}MB" -ForegroundColor Yellow
-            Write-Host ""
-        } else {
-            Generate-Report -ScanData $scanData -MinSizeMB $minSize
-            
-            Write-Host "  Found $($scanData.TotalFiles) large files" -ForegroundColor Green
+        if ($scanData.TotalFiles -gt 0) {
             Write-Host "  Review the report: $reportFile" -ForegroundColor Cyan
             Write-Host ""
         }
@@ -374,15 +248,10 @@ switch ($choice) {
     "2" {
         Show-Header "SCAN AND MIGRATE"
         $minSize = Get-MinimumSize
-        $scanData = Scan-LargeFiles -MinSizeMB $minSize
+        $scanData = Invoke-ScanWorkflow -MinSize $minSize
         
-        if ($scanData.TotalFiles -eq 0) {
-            Write-Host ""
-            Write-Host "  No files found larger than ${minSize}MB" -ForegroundColor Yellow
-            Write-Host ""
-        } else {
-            Generate-Report -ScanData $scanData -MinSizeMB $minSize
-            Move-FilesToD -ScanData $scanData
+        if ($scanData.TotalFiles -gt 0) {
+            Invoke-MigrationWorkflow -ScanData $scanData
         }
     }
     
