@@ -64,6 +64,14 @@ $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "$PSScriptRoot\MoveLog_$timestamp.txt"
 
 # System and program folders to exclude (protect all application data)
+# 
+# Files that WILL be moved (user content):
+#   - Documents, Downloads, Videos, Pictures, Desktop
+#   - Teams meeting recordings (Videos/Recordings or Downloads)
+#   - Large media files, installers, ISOs, backups
+#   - Any user-created content outside excluded folders
+#
+# Files that will NOT be moved (protected):
 $excludeFolders = @(
     # Application data (critical - DO NOT MOVE)
     'AppData',              # All application settings and data
