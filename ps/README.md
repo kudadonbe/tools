@@ -36,6 +36,13 @@ Get-ExecutionPolicy -List
   - Excludes system folders (AppData, node_modules, etc.)
   - Generates formatted report
 
+- **Move-LargeFilesToD.ps1** - Migrates large files from C:\Users to D:\Users
+  - Copies files to D: preserving folder structure
+  - Verifies copy using SHA256 hash comparison
+  - Only deletes from C: after successful verification
+  - Creates detailed operation log
+  - Supports -WhatIf for preview mode
+
 ---
 
 ## 🚀 Usage Examples
@@ -49,6 +56,18 @@ cd C:\path\to\tools
 .\ps\Users\Find-LargeUserFiles.ps1
 
 # When prompted, enter minimum size in MB (or press Enter for 200MB default)
+```
+
+### Move Large Files to D: Drive
+```powershell
+# Preview what would be moved (safe)
+.\ps\Users\Move-LargeFilesToD.ps1 -MinSizeMB 500 -WhatIf
+
+# Actually move files (interactive prompt for size)
+.\ps\Users\Move-LargeFilesToD.ps1
+
+# Move files 1GB+ without prompt
+.\ps\Users\Move-LargeFilesToD.ps1 -MinSizeMB 1024
 ```
 
 ---

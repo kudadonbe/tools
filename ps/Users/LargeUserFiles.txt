@@ -1,18 +1,15 @@
 ﻿================================================================================
-LARGE FILES REPORT (Files > 1000MB)
-Generated: 2025-11-26 16:10:42
-Total files found: 52
+LARGE FILES REPORT (Files > 1500MB)
+Generated: 2025-11-26 16:30:29
+Total files found: 41
 ================================================================================
 
 
 hussain (Users/hussain)
 --------------------------------------------------------------------------------
 ~/Downloads/IsQaziMahir.mp4                                            | 4657.73 MB
-~/Downloads/Video/shaih video.mp4                                      | 1372.81 MB
-~/Downloads/Video/ShKInterHigh.mp4                                     | 1371.71 MB
-~/Downloads/Video/ShKInter.mp4                                         | 1371.66 MB
 
-Subtotal: 4 files, 8773.91 MB
+Subtotal:  files, 4657.73 MB
 
 
 Zayaan (Users/Zayaan)
@@ -37,8 +34,8 @@ Zayaan (Users/Zayaan)
 ~/Downloads/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Setup/Adobe Photoshop 25.2 Beta.exe | 3354.43 MB
 ~/Downloads/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Setup/Adobe Photoshop 25.4 Beta.exe | 3331.57 MB
 ~/Downloads/Microsoft Office 2016-2021 Version 2212 Build 15928.20198 LTSC AIO + Visio + Project Retail-VL/Office/Data/16.0.15928.20198/stream.x64.x-none.dat | 3263.75 MB
-~/Downloads/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Setup/Neural Filters.exe | 2553.41 MB
 ~/Downloads/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Setup/Neural Filters.exe | 2553.41 MB
+~/Downloads/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Setup/Neural Filters.exe | 2553.41 MB
 ~/Downloads/Autodesk AutoCAD v2024 (x64) + Fix {CracksHash}/Setup_64bit/Setup_64bit_.zip | 2502.96 MB
 ~/Downloads/Desktop/454 Fm-C 2024 (28.08.2024).mp4                     | 2292.11 MB
 ~/Downloads/Adobe Photoshop 2025 v26.0 (x64)/Adobe Photoshop 2025 v26.0 (x64)/Setup/Adobe 2025/products/PHSP/AdobePhotoshop26-Core_x64.zip | 2229.7 MB
@@ -57,14 +54,6 @@ Zayaan (Users/Zayaan)
 ~/Downloads/Drive.zip                                                  | 1545.74 MB
 ~/Downloads/Shan.zip                                                   | 1539.51 MB
 ~/Downloads/Aisha.zip                                                  | 1520.63 MB
-~/Downloads/Yamin.zip                                                  | 1496.64 MB
-~/OneDrive - familycourtgovmv/Works/Designs (Cards, Lanyards, Shirt, Boards, Stickers)/Office Card/Mauzoon Cards/Mauzoon Cards M1001-M1012.zip | 1474.72 MB
-~/OneDrive - familycourtgovmv/Attachments/Mauzoon Cards M1001-M1012.zip | 1474.72 MB
-~/Downloads/Ta Ra Rum Pum 2007 Hindi 720p AMZN WEBRip x264 AAC 5.1 MSubs - LOKiHD - Telly/Ta Ra Rum Pum 2007 Hindi 720p AMZN WEBRip x264 AAC 5.1 MSubs - LOKiHD - Telly.mkv | 1363.67 MB
-~/Downloads/Adobe Illustrator 2024 v28.0.0.88 (x64) Pre-Activated/Adobe Illustrator 2024 v28.0.0.88 (x64) Pre-Activated/Setup/Setup-2.bin | 1110.46 MB
-~/Downloads/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Setup/Camera Raw.exe | 1090.76 MB
-~/Downloads/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Setup/Camera Raw.exe | 1089.54 MB
-~/Downloads/Adobe Photoshop 2025 v26.0 (x64)/Adobe Photoshop 2025 v26.0 (x64)/Setup/Adobe 2025/products/ACR/AdobeCameraRawProfile8.0All.zip | 1026.23 MB
 
-Subtotal: 48 files, 211851.45 MB
+Subtotal: 40 files, 201724.71 MB
 
