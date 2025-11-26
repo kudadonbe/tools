@@ -31,7 +31,15 @@ Get-ExecutionPolicy -List
 ## 📁 Available Scripts
 
 ### Users/
-- **Find-LargeUserFiles.ps1** - Scans user directories for large files
+- **Manage-LargeUserFiles.ps1** ⭐ **(Recommended - Interactive TUI)**
+  - Combined interface for scanning and managing large files
+  - Option 1: Generate report only
+  - Option 2: Scan and migrate to D: drive
+  - Interactive menu-driven interface
+  - Safe migration with hash verification
+  - Ideal for Teams recordings and large media files
+
+- **Find-LargeUserFiles.ps1** - Scans user directories for large files (report only)
   - Configurable size threshold (default: 200MB)
   - Excludes system folders (AppData, node_modules, etc.)
   - Generates formatted report
@@ -47,18 +55,29 @@ Get-ExecutionPolicy -List
 
 ## 🚀 Usage Examples
 
-### Find Large Files
+### Manage Large Files (Interactive - Recommended)
 ```powershell
 # Navigate to repo
 cd C:\path\to\tools
 
+# Run the interactive manager
+.\ps\Users\Manage-LargeUserFiles.ps1
+
+# You'll see a menu:
+#   [1] Scan and generate report only
+#   [2] Scan and move files to D: drive
+#   [3] Exit
+```
+
+### Find Large Files (Report Only)
+```powershell
 # Run script
 .\ps\Users\Find-LargeUserFiles.ps1
 
 # When prompted, enter minimum size in MB (or press Enter for 200MB default)
 ```
 
-### Move Large Files to D: Drive
+### Move Large Files to D: Drive (Advanced)
 ```powershell
 # Preview what would be moved (safe)
 .\ps\Users\Move-LargeFilesToD.ps1 -MinSizeMB 500 -WhatIf
