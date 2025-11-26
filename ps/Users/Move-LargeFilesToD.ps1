@@ -63,11 +63,73 @@ Write-Host ""
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logFile = "$PSScriptRoot\MoveLog_$timestamp.txt"
 
-# System folders to exclude
+# System and program folders to exclude (protect all application data)
 $excludeFolders = @(
-    'AppData', 'Application Data', '.nuget', '.vscode', '.android', 
-    '.gradle', 'node_modules', 'OneDrive', 'Saved Games', 
-    'Searches', 'Links', 'Contacts', 'Favorites'
+    # Application data (critical - DO NOT MOVE)
+    'AppData',              # All application settings and data
+    'Application Data',     # Legacy app data symlink
+    'Local Settings',       # Legacy local settings
+    
+    # Development tools (packages and caches)
+    '.nuget',               # NuGet packages
+    '.vscode',              # VS Code settings
+    '.android',             # Android SDK
+    '.gradle',              # Gradle cache
+    '.docker',              # Docker data
+    '.m2',                  # Maven repository
+    '.npm',                 # NPM cache
+    '.cargo',               # Rust packages
+    'node_modules',         # Node.js packages
+    'venv',                 # Python virtual environments
+    'env',                  # Python virtual environments
+    '.virtualenv',          # Python virtual environments
+    
+    # Cloud sync folders (already backed up)
+    'OneDrive',             # OneDrive sync
+    'Dropbox',              # Dropbox sync
+    'Google Drive',         # Google Drive sync
+    'iCloudDrive',          # iCloud sync
+    
+    # Windows system folders
+    'Saved Games',          # Game saves
+    'Searches',             # Saved searches
+    'Links',                # Quick access links
+    'Contacts',             # Windows contacts
+    'Favorites',            # Browser favorites
+    'Cookies',              # Browser cookies
+    'NetHood',              # Network shortcuts
+    'PrintHood',            # Printer shortcuts
+    'Recent',               # Recent files list
+    'SendTo',               # Send to menu items
+    'Start Menu',           # Start menu shortcuts
+    'Templates',            # Document templates
+    
+    # Browser profiles (contain settings and extensions)
+    '.mozilla',             # Firefox
+    '.chrome',              # Chrome
+    'Chrome',               # Chrome user data
+    'Firefox',              # Firefox user data
+    'Edge',                 # Edge user data
+    
+    # Program-specific folders
+    '.ssh',                 # SSH keys (security sensitive)
+    '.gnupg',               # GPG keys (security sensitive)
+    '.aws',                 # AWS credentials (security sensitive)
+    '.kube',                # Kubernetes config (security sensitive)
+    'workspace',            # IDE workspaces
+    '.idea',                # IntelliJ settings
+    '.eclipse',             # Eclipse settings
+    
+    # Game launchers
+    'Steam',                # Steam (program files)
+    'Epic Games',           # Epic Games launcher
+    'Battle.net',           # Blizzard launcher
+    
+    # System cache
+    'Temp',                 # Temporary files
+    'tmp',                  # Temporary files
+    'cache',                # General cache
+    'Cache'                 # General cache
 )
 
 # ============================================================================
@@ -180,9 +242,9 @@ foreach ($userFolder in $userFolders) {
                     Write-Log "Created directory: $destDir"
                 }
                 
-                # Copy file
+                # Copy file (NOT move - safer for locked files)
                 Write-Host "    Copying to D: drive..." -ForegroundColor Yellow
-                Copy-Item -Path $file.FullName -Destination $destPath -Force
+                Copy-Item -Path $file.FullName -Destination $destPath -Force -ErrorAction Stop
                 
                 # Verify copy with hash comparison
                 Write-Host "    Verifying copy..." -ForegroundColor Yellow
@@ -190,15 +252,21 @@ foreach ($userFolder in $userFolders) {
                 $destHash = Get-FileHashQuick -Path $destPath
                 
                 if ($sourceHash -and $destHash -and ($sourceHash -eq $destHash)) {
-                    # Verification successful - delete original
+                    # Verification successful - safely delete original
                     Write-Host "    ✓ Verified! Deleting from C: drive..." -ForegroundColor Green
-                    Remove-Item -Path $file.FullName -Force
+                    
+                    # Attempt to delete (may fail if file is locked - that's OK)
+                    try {
+                        Remove-Item -Path $file.FullName -Force -ErrorAction Stop
+                        $stats.DeletedFiles++
+                        Write-Log "SUCCESS: Moved $($file.FullName) → $destPath ($fileSizeMB MB)" "SUCCESS"
+                    } catch {
+                        Write-Host "    ⚠ Could not delete (file may be locked). Copy successful, original kept." -ForegroundColor Yellow
+                        Write-Log "WARNING: Copied but could not delete $($file.FullName): $($_.Exception.Message)" "WARNING"
+                    }
                     
                     $stats.CopiedFiles++
-                    $stats.DeletedFiles++
                     $stats.TotalBytesMoved += $file.Length
-                    
-                    Write-Log "SUCCESS: Moved $($file.FullName) → $destPath ($fileSizeMB MB)" "SUCCESS"
                 } else {
                     # Verification failed - keep original
                     Write-Host "    ✗ Hash mismatch! Keeping original file." -ForegroundColor Red
