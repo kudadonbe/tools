@@ -109,7 +109,6 @@ function Invoke-MigrationWorkflow {
     Write-Host ("=" * 80) -ForegroundColor Yellow
     Write-Host ""
     
-    # Check if D: exists
     if (-not (Test-Path "D:\")) {
         Write-Host "  ERROR: D: drive not found!" -ForegroundColor Red
         Write-Host ""
@@ -159,41 +158,38 @@ function Invoke-MigrationWorkflow {
             Write-Host "    Processing: $($file.Path) ($($file.SizeMB) MB)" -ForegroundColor Gray
             
             try {
-                # Copy with verification
-                Write-Host "      → Copying..." -ForegroundColor DarkGray
+                Write-Host "      -> Copying..." -ForegroundColor DarkGray
                 $copySuccess = Copy-FileWithVerification -SourcePath $sourcePath -DestinationPath $destPath
                 
                 if ($copySuccess) {
-                    # Try to delete
-                    Write-Host "      → Verifying..." -ForegroundColor DarkGray
+                    Write-Host "      -> Verifying..." -ForegroundColor DarkGray
                     try {
                         Remove-Item -Path $sourcePath -Force -ErrorAction Stop
                         $stats.DeletedFiles++
-                        Write-Host "      ✓ Migrated successfully" -ForegroundColor Green
-                        Write-FileLog -Message "SUCCESS: Moved $sourcePath → $destPath ($($file.SizeMB) MB)" -Level 'SUCCESS' -LogPath $logFile
+                        Write-Host "      [OK] Migrated successfully" -ForegroundColor Green
+                        Write-FileLog -Message "SUCCESS: Moved $sourcePath to $destPath ($($file.SizeMB) MB)" -Level 'SUCCESS' -LogPath $logFile
                     } catch {
-                        Write-Host "      ⚠ Copied but file is locked (kept on C:)" -ForegroundColor Yellow
+                        Write-Host "      [WARN] Copied but file is locked (kept on C:)" -ForegroundColor Yellow
                         Write-FileLog -Message "WARNING: Copied but locked: $sourcePath" -Level 'WARNING' -LogPath $logFile
                     }
                     
                     $stats.CopiedFiles++
                     $stats.TotalBytesMoved += ($file.SizeMB * 1MB)
                 } else {
-                    Write-Host "      ✗ Verification failed!" -ForegroundColor Red
+                    Write-Host "      [ERROR] Verification failed!" -ForegroundColor Red
                     $stats.FailedFiles++
                     Write-FileLog -Message "ERROR: Hash mismatch for $sourcePath" -Level 'ERROR' -LogPath $logFile
                 }
                 
             } catch {
                 $stats.FailedFiles++
-                Write-Host "      ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "      [ERROR] Failed: $($_.Exception.Message)" -ForegroundColor Red
                 Write-FileLog -Message "ERROR: $sourcePath - $($_.Exception.Message)" -Level 'ERROR' -LogPath $logFile
             }
         }
         Write-Host ""
     }
     
-    # Show summary
     Write-Host ""
     Write-Host ("=" * 80) -ForegroundColor Green
     Write-Host "  MIGRATION COMPLETE" -ForegroundColor Green
@@ -218,14 +214,14 @@ Show-Header "LARGE USER FILES MANAGER"
 Write-Host "  This tool helps you manage large files in C:\Users" -ForegroundColor White
 Write-Host ""
 Write-Host "  Files that WILL be scanned:" -ForegroundColor Green
-Write-Host "    • Documents, Downloads, Videos, Pictures, Desktop" -ForegroundColor Gray
-Write-Host "    • Teams meeting recordings" -ForegroundColor Gray
-Write-Host "    • Large media files, ISOs, backups" -ForegroundColor Gray
+Write-Host "    * Documents, Downloads, Videos, Pictures, Desktop" -ForegroundColor Gray
+Write-Host "    * Teams meeting recordings" -ForegroundColor Gray
+Write-Host "    * Large media files, ISOs, backups" -ForegroundColor Gray
 Write-Host ""
 Write-Host "  Files that will NOT be touched:" -ForegroundColor Yellow
-Write-Host "    • AppData (program settings)" -ForegroundColor Gray
-Write-Host "    • Cloud sync folders (OneDrive, Dropbox, etc.)" -ForegroundColor Gray
-Write-Host "    • Development tools and caches" -ForegroundColor Gray
+Write-Host "    * AppData (program settings)" -ForegroundColor Gray
+Write-Host "    * Cloud sync folders (OneDrive, Dropbox, etc.)" -ForegroundColor Gray
+Write-Host "    * Development tools and caches" -ForegroundColor Gray
 Write-Host ""
 
 Show-Menu
