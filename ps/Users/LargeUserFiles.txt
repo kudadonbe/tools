@@ -1,0 +1,70 @@
+﻿================================================================================
+LARGE FILES REPORT (Files > 1000MB)
+Generated: 2025-11-26 16:10:42
+Total files found: 52
+================================================================================
+
+
+hussain (Users/hussain)
+--------------------------------------------------------------------------------
+~/Downloads/IsQaziMahir.mp4                                            | 4657.73 MB
+~/Downloads/Video/shaih video.mp4                                      | 1372.81 MB
+~/Downloads/Video/ShKInterHigh.mp4                                     | 1371.71 MB
+~/Downloads/Video/ShKInter.mp4                                         | 1371.66 MB
+
+Subtotal: 4 files, 8773.91 MB
+
+
+Zayaan (Users/Zayaan)
+--------------------------------------------------------------------------------
+~/Downloads/Adobe Premiere Pro 2025 v25.0 Multilingual (macOS)/Adobe Premiere Pro 2025 v25.0 Multilingual (macOS)/Application/Adobe Premiere Pro 2025 v25.0 macOS.dmg | 17396.49 MB
+~/Downloads/VeeamDataPlatformPremium_v12.3.1_20250401.iso              | 14738.51 MB
+~/Downloads/S918BXXS7CXL2_S918BOXM7CXK4_LYS.zip                        | 14578.98 MB
+~/OneDrive - familycourtgovmv/Desktop/S918BXXS7CXL2_S918BOXM7CXK4_LYS.zip | 14578.98 MB
+~/Downloads/SAMFW.COM_SM-S918B_XSG_S918BXXS8CYBD_fac.zip               | 14534.21 MB
+~/Downloads/SAMFW.COM_SM-S918B_LYS_S918BXXS8CYBD_fac.zip               | 14534.21 MB
+~/OneDrive - familycourtgovmv/Desktop/40 PLUS MASTER/Olympus Master 02 AI .mp4 | 7920.03 MB
+~/Downloads/VMware-VCSA-all-7.0.0-16189094.iso                         | 7125.55 MB
+~/Downloads/Win11_23H2_EnglishInternational_x64v2.iso                  | 6482.79 MB
+~/OneDrive - familycourtgovmv/Desktop/40 PLUS MASTER/001 Olympus Master BI .mp4 | 6211.72 MB
+~/Downloads/Windows 10 X64 22H2 Pro incl Office 2021 en-US AUG 2023 {Gen2}/WIN10PRO.OFF21.ENU.AUG.ISO | 6048.56 MB
+~/Downloads/Win10_22H2_English_x64v1.iso                               | 5856.49 MB
+~/Downloads/Windows 11 X64 22H2 Pro incl Office 2021 en-US MAY 2023 {Gen2}/WIN11.OFF21.ENU.MAY2023.ISO | 5808.44 MB
+~/Downloads/Windows11.iso                                              | 5400.25 MB
+~/Downloads/Tiny11 2023.10 (Windows 11 Lite)/Tiny11 2023.10 (Windows 11 Lite)/ISO/tiny11 23H2 x64.iso | 4259.81 MB
+~/Downloads/Tiny11 v2023.11 (Windows 11 Lite) Pre-Activated/Tiny11 v2023.11 (Windows 11 Lite) Pre-Activated/ISO/tiny11 2311 x64.iso | 3612.69 MB
+~/OneDrive - familycourtgovmv/Desktop/Backup/New folder/477bf92e68462aa10b9bfd37c98ae5a99a846c59861e70dac4f022025aa3551f.zip | 3602.76 MB
+~/Downloads/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Setup/Adobe Photoshop 25.2 Beta.exe | 3354.43 MB
+~/Downloads/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Setup/Adobe Photoshop 25.4 Beta.exe | 3331.57 MB
+~/Downloads/Microsoft Office 2016-2021 Version 2212 Build 15928.20198 LTSC AIO + Visio + Project Retail-VL/Office/Data/16.0.15928.20198/stream.x64.x-none.dat | 3263.75 MB
+~/Downloads/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Setup/Neural Filters.exe | 2553.41 MB
+~/Downloads/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Setup/Neural Filters.exe | 2553.41 MB
+~/Downloads/Autodesk AutoCAD v2024 (x64) + Fix {CracksHash}/Setup_64bit/Setup_64bit_.zip | 2502.96 MB
+~/Downloads/Desktop/454 Fm-C 2024 (28.08.2024).mp4                     | 2292.11 MB
+~/Downloads/Adobe Photoshop 2025 v26.0 (x64)/Adobe Photoshop 2025 v26.0 (x64)/Setup/Adobe 2025/products/PHSP/AdobePhotoshop26-Core_x64.zip | 2229.7 MB
+~/Downloads/Adobe Photoshop 2024 v25.7.0.504 (x64)/Adobe Photoshop 2024 v25.7.0.504 (x64)/Setup/Adobe 2024/products/PHSP/AdobePhotoshop25-Core_x64.zip | 2186.35 MB
+~/Downloads/Autodesk AutoCAD LT v2024 (x64) + Fix {CracksHash}/Setup_64bit/Setup_64bit.zip | 2038.46 MB
+~/Downloads/Adobe Illustrator 2024 v28.0.0.88 (x64) Pre-Activated/Adobe Illustrator 2024 v28.0.0.88 (x64) Pre-Activated/Setup/Setup-1.bin | 1995.61 MB
+~/Downloads/Adobe Lightroom Classic 2025 v14.0.1 (x64)/Adobe Lightroom Classic 2025 v14.0.1 (x64)/Setup/Adobe 2025/products/LTRM/AdobeLightroom-mul.zip | 1987.09 MB
+~/OneDrive - familycourtgovmv/Desktop/Backup/New folder/Microsoft Office 2021 LTSC v2108 Build 14332.20529 (x64) Pre-Activated {CracksHash}/Setup(Pre-Activated)/Office_2021_16.0.14332.20529_Preactivated_English_x64.zip | 1980.68 MB
+~/Downloads/Microsoft Office 2021 LTSC v2108 Build 14332.20597 (x64) Pre-Activated {CracksHash}/Office_21 (Patched)/Office_2021_16.0.14332.20597_x64.zip | 1889.04 MB
+~/Downloads/Adobe Photoshop 2025 v26.0 (x64)/Setup/products/PHSP/AdobePhotoshop26-Core_x64.zip | 1868.58 MB
+~/Downloads/Adobe Premiere Pro 2024 v24.0.3.2 (x64) Pre-Activated/Adobe Premiere Pro 2024 v24.0.3.2 (x64) Pre-Activated/Setup/Adobe 2024/products/PPRO/AdobePremierePro24AllTrial.zip | 1817.44 MB
+~/Downloads/Animal (2023) Hindi 1080p HDTS x264 AAC 2GB - QRips.mkv    | 1811.98 MB
+~/Downloads/Adobe Illustrator 2025 v29.0.1.192 (x64)/Adobe Illustrator 2025 v29.0.1.192 (x64)/Setup/Adobe 2025/products/ILST/AdobeIllustrator29-Core.zip | 1609.96 MB
+~/Downloads/CorelDRAW Graphics Suite 2024 v25.2.0.301 (x64) + Fix {CracsHash}/Setup/Setup.zip | 1587.25 MB
+~/Downloads/[FTUApps.com] - Microsoft Office LTSC 2021 Pro Plus 16.0.14332.20255 Standard + Visio + Project [RePack]/Office/Data/16.0.14332.20255/stream.x64.x-none.dat | 1574.58 MB
+~/Downloads/Drive.zip                                                  | 1545.74 MB
+~/Downloads/Shan.zip                                                   | 1539.51 MB
+~/Downloads/Aisha.zip                                                  | 1520.63 MB
+~/Downloads/Yamin.zip                                                  | 1496.64 MB
+~/OneDrive - familycourtgovmv/Works/Designs (Cards, Lanyards, Shirt, Boards, Stickers)/Office Card/Mauzoon Cards/Mauzoon Cards M1001-M1012.zip | 1474.72 MB
+~/OneDrive - familycourtgovmv/Attachments/Mauzoon Cards M1001-M1012.zip | 1474.72 MB
+~/Downloads/Ta Ra Rum Pum 2007 Hindi 720p AMZN WEBRip x264 AAC 5.1 MSubs - LOKiHD - Telly/Ta Ra Rum Pum 2007 Hindi 720p AMZN WEBRip x264 AAC 5.1 MSubs - LOKiHD - Telly.mkv | 1363.67 MB
+~/Downloads/Adobe Illustrator 2024 v28.0.0.88 (x64) Pre-Activated/Adobe Illustrator 2024 v28.0.0.88 (x64) Pre-Activated/Setup/Setup-2.bin | 1110.46 MB
+~/Downloads/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Adobe Photoshop 2024 v25.4 Beta Pre-Activated/Setup/Camera Raw.exe | 1090.76 MB
+~/Downloads/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Adobe Photoshop 2024 v25.2 Beta Pre-Activated/Setup/Camera Raw.exe | 1089.54 MB
+~/Downloads/Adobe Photoshop 2025 v26.0 (x64)/Adobe Photoshop 2025 v26.0 (x64)/Setup/Adobe 2025/products/ACR/AdobeCameraRawProfile8.0All.zip | 1026.23 MB
+
+Subtotal: 48 files, 211851.45 MB
+
