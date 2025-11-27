@@ -27,7 +27,7 @@
 
 3. **Clone the repository**:
     ```bash
-    git clone https://github.com/kdmdonbe/tools.git
+    git clone https://github.com/kudadonbe/tools.git
     cd tools
     ```
 
@@ -70,7 +70,7 @@
 
 3. **Clone and install**:
     ```bash
-    git clone https://github.com/kdmdonbe/tools.git
+    git clone https://github.com/kudadonbe/tools.git
     cd tools
     pip install --user -e ".[dev]"
     ```
