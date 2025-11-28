@@ -35,3 +35,4 @@ tools.egg-info/
 # ---------------------------------------------------
 .env
 config/firebase-key.json
+go/.DS_Store

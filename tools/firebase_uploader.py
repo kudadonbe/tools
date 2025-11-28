@@ -7,7 +7,6 @@
 # Date: 2025-03-26
 # ---------------------------------------------
 
-import os
 import json
 import click
 from pathlib import Path
