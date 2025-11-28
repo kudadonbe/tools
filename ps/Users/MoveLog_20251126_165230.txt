@@ -1,0 +1,5 @@
+[2025-11-26 16:53:32] [INFO] Starting migration to D: drive
+[2025-11-26 16:57:54] [SUCCESS] SUCCESS: Moved C:\Users\Zayaan\Downloads\Adobe Premiere Pro 2025 v25.0 Multilingual (macOS)\Adobe Premiere Pro 2025 v25.0 Multilingual (macOS)\Application\Adobe Premiere Pro 2025 v25.0 macOS.dmg to D:\Users\Zayaan\Downloads\Adobe Premiere Pro 2025 v25.0 Multilingual (macOS)\Adobe Premiere Pro 2025 v25.0 Multilingual (macOS)\Application\Adobe Premiere Pro 2025 v25.0 macOS.dmg (17396.49 MB)
+[2025-11-26 17:01:32] [SUCCESS] SUCCESS: Moved C:\Users\Zayaan\Downloads\VeeamDataPlatformPremium_v12.3.1_20250401.iso to D:\Users\Zayaan\Downloads\VeeamDataPlatformPremium_v12.3.1_20250401.iso (14738.51 MB)
+[2025-11-26 17:05:10] [SUCCESS] SUCCESS: Moved C:\Users\Zayaan\Downloads\S918BXXS7CXL2_S918BOXM7CXK4_LYS.zip to D:\Users\Zayaan\Downloads\S918BXXS7CXL2_S918BOXM7CXK4_LYS.zip (14578.98 MB)
+[2025-11-26 17:08:37] [SUCCESS] SUCCESS: Moved C:\Users\Zayaan\OneDrive - familycourtgovmv\Desktop\S918BXXS7CXL2_S918BOXM7CXK4_LYS.zip to D:\Users\Zayaan\OneDrive - familycourtgovmv\Desktop\S918BXXS7CXL2_S918BOXM7CXK4_LYS.zip (14578.98 MB)

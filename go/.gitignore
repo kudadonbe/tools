@@ -1,0 +1,9 @@
+# Build output
+userfiles-manager*
+*.exe
+
+# Test files
+*.txt
+
+# Go build cache
+go.sum
