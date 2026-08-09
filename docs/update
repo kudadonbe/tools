@@ -7,7 +7,7 @@ function Start-KudaInstall {
     }
 
     # Rest of your script logic here
-    Write-Host "✅ Hello from Kuda Tools installer!"
+    Write-Host "✅ Hello from Kudadonbe installer!"
 }
 
 Start-KudaInstall
