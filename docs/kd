@@ -1,0 +1,153 @@
+# =============================================================================
+#  run.ps1  -  KUDADONBE Network Tools launcher
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  Shows a numbered menu of the tools and runs whichever one you pick, so you
+#  remember ONE line instead of each tool's own. Two modes, from one file:
+#    - on a managed LAN (ShareBase set): reads each tool as .txt off the share.
+#    - public (no ShareBase): fetches each tool from the public hub over https.
+#  The public menu lists only the tools flagged Public.
+#
+#     irm <host>/<launcher> | iex
+#
+#  After a tool finishes it returns to the menu, so you can run several tools
+#  in one session. Pick 0 (or just press Enter) to quit.
+#
+#  ADDING A TOOL
+#  -------------
+#  Add one line to the $tools list below (Name, Public, Desc). Internal fetch
+#  is <ShareBase>\<Name>.txt; public fetch is <PublicBase>/<Name>.
+# =============================================================================
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
+$Site = @{
+    ShareBase  = ''
+    PublicBase = 'https://kudadonbe.github.io/tools'
+}
+# <#/SITE#>
+
+# ShareBase present -> internal (read .txt off the share). Empty -> public
+# (fetch each tool from the hub over https, and show only Public tools).
+$public = -not $Site.ShareBase
+
+# --- Tool catalogue --------------------------------------------------------
+#  Name = tool + menu label, Public = shown/allowed in the public menu,
+#  Desc = one-line description. Fetch target is derived from the mode.
+$tools = @(
+    [pscustomobject]@{ Name = 'newpc';           Public = $false; Desc = 'Set up a new PC (admin)' }
+    [pscustomobject]@{ Name = 'add-printer';     Public = $false; Desc = 'Connect / share a printer (admin)' }
+    [pscustomobject]@{ Name = 'printer-info';    Public = $true;  Desc = "Show a PC's printers, remotely" }
+    [pscustomobject]@{ Name = 'print-diag';      Public = $true;  Desc = 'Diagnose print sharing failures' }
+    [pscustomobject]@{ Name = 'clearprinterspool'; Public = $true; Desc = 'Clear stuck print jobs' }
+    [pscustomobject]@{ Name = 'sysinfo';         Public = $true;  Desc = 'PC inventory snapshot' }
+    [pscustomobject]@{ Name = 'gateway-monitor'; Public = $true;  Desc = 'Connectivity diagnostic' }
+)
+# The menu: everything internally, only the Public ones on the hub.
+$menu = if ($public) { @($tools | Where-Object Public) } else { $tools }
+
+
+function Show-Menu {
+    Write-Host ''
+    Write-Host ('=' * 44) -ForegroundColor Cyan
+    Write-Host '  KUDADONBE Tools' -ForegroundColor Cyan
+    Write-Host ('=' * 44) -ForegroundColor Cyan
+    for ($i = 0; $i -lt $menu.Count; $i++) {
+        Write-Host ("  {0}.  {1,-18}{2}" -f ($i + 1), $menu[$i].Name, $menu[$i].Desc)
+    }
+    # On the public hub, offer to load the full office menu from a share the
+    # technician names at runtime. Nothing about the office is baked in here.
+    if ($public) { Write-Host '  O.  Office tools        (load the full menu from an office share)' -ForegroundColor DarkCyan }
+    Write-Host '  0.  exit'
+    Write-Host ('=' * 44) -ForegroundColor Cyan
+}
+
+
+# Load the INTERNAL launcher (run.txt) from an office share the tech types in,
+# then hand control to it - it carries the office config and the full toolset.
+# The path is entered every time, so this public file leaks nothing.
+function Invoke-OfficeMenu {
+    Write-Host ''
+    $sp = (Read-Host '  Office share path (e.g. \\server\share\...\04_Network)').Trim()
+    if (-not $sp) { return }
+    $runTxt = Join-Path $sp 'run.txt'
+
+    $code = $null
+    try { $code = Get-Content -Path $runTxt -Raw -ErrorAction Stop }
+    catch {
+        Write-Host "  Could not read $runTxt" -ForegroundColor Yellow
+        $ans = Read-Host '  Sign in with a domain account and retry? (y/n)'
+        if ($ans -eq 'y') {
+            $cred = Get-Credential -Message 'Domain account with access to the office share'
+            if ($cred) {
+                try {
+                    New-PSDrive -Name KDOffice -PSProvider FileSystem -Root $sp -Credential $cred -ErrorAction Stop | Out-Null
+                    $code = Get-Content -Path $runTxt -Raw -ErrorAction Stop
+                }
+                catch { Write-Host "  Still no access: $($_.Exception.Message)" -ForegroundColor Red }
+                finally { Remove-PSDrive -Name KDOffice -Force -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($code)) {
+        Write-Host '  Tip: a brand-new PC has no network yet - use the setup pen for those.' -ForegroundColor DarkGray
+        return
+    }
+    & ([scriptblock]::Create($code))
+}
+
+
+# --- Main loop -------------------------------------------------------------
+while ($true) {
+    Show-Menu
+    $choice = Read-Host '  Select a tool'
+
+    # 0 or empty = quit
+    if ($choice -eq '0' -or [string]::IsNullOrWhiteSpace($choice)) {
+        Write-Host '  Done.' -ForegroundColor Green
+        break
+    }
+
+    # Public hub only: 'O' loads the full office menu from a named share.
+    if ($public -and $choice -match '^[Oo]$') { Invoke-OfficeMenu; continue }
+
+    # Validate the choice is a number within range
+    $index = 0
+    if (-not [int]::TryParse($choice, [ref]$index) -or $index -lt 1 -or $index -gt $menu.Count) {
+        Write-Host "  Invalid choice: '$choice'" -ForegroundColor Yellow
+        continue
+    }
+
+    $tool = $menu[$index - 1]
+
+    Write-Host ''
+    Write-Host "  Launching $($tool.Name)..." -ForegroundColor Cyan
+    Write-Host ''
+
+    # Fetch the tool's text and run it. [scriptblock]::Create + & runs it with
+    # its own param() defaults intact. Internal: Get-Content off the share (the
+    # reliable way to read a UNC path on Windows PowerShell 5.1). Public: irm
+    # over https (which works on both 5.1 and 7 for a real URL).
+    try {
+        if ($public) {
+            $code = Invoke-RestMethod -Uri "$($Site.PublicBase)/$($tool.Name)" -ErrorAction Stop
+        } else {
+            $code = Get-Content -Path (Join-Path $Site.ShareBase "$($tool.Name).txt") -Raw -ErrorAction Stop
+        }
+        if ([string]::IsNullOrWhiteSpace($code)) { throw 'tool is empty' }
+        & ([scriptblock]::Create($code))
+    } catch {
+        Write-Host "  Failed to run $($tool.Name): $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    Write-Host ''
+    Write-Host '  --- tool finished, returning to menu ---' -ForegroundColor DarkGray
+}
