@@ -71,14 +71,14 @@ function Show-Menu {
 }
 
 
-# Load the INTERNAL launcher (run.txt) from an office share the tech types in,
+# Load the INTERNAL launcher (kd.txt) from an office share the tech types in,
 # then hand control to it - it carries the office config and the full toolset.
 # The path is entered every time, so this public file leaks nothing.
 function Invoke-OfficeMenu {
     Write-Host ''
     $sp = (Read-Host '  Office share path (e.g. \\server\share\...\04_Network)').Trim()
     if (-not $sp) { return }
-    $runTxt = Join-Path $sp 'run.txt'
+    $runTxt = Join-Path $sp 'kd.txt'
 
     $code = $null
     try { $code = Get-Content -Path $runTxt -Raw -ErrorAction Stop }
