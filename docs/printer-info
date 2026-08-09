@@ -1,0 +1,194 @@
+# =============================================================================
+#  printer-info.ps1  -  Look at any PC's printers, from your own desk
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  Given a PC (name, IP, or staff name) it shows, remotely and read-only:
+#    - its printers: share name, driver, port, status
+#    - who is allowed to print on each shared one (decoded from the ACL)
+#    - stuck / errored jobs sitting in the queues
+#    - the physical (USB / TCP-IP) ports
+#
+#  Nothing is changed on either PC. It is the "what's going on over there"
+#  companion to add-printer.
+#
+#  HOW TO RUN
+#  ----------
+#  From the pen or share menu, pick "printer-info". Or directly:
+#     irm <host>/printer-info | iex
+#
+#  It is INTERACTIVE - it asks for the PC, it does not take parameters (they
+#  cannot be passed through iex, which is how the menu launches every tool).
+#
+#  ONE HARD RULE: query by NAME, not IP.  Get-Printer -ComputerName <ip> is
+#  refused by Windows; the same call against the hostname works. So an IP is
+#  always resolved to a name first - if it has none in DNS, only the net-view
+#  fallback is possible.
+# =============================================================================
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
+$Site = @{
+    ShareBase = ''
+}
+# <#/SITE#>
+
+function Write-Head($text) {
+    Write-Host ''
+    Write-Host ('=' * 60) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 60) -ForegroundColor Cyan
+}
+function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+
+
+# Turn the ACL's SID-strings into names a human reads, and its rights bits into
+# plain words. Only the printer-level ACEs matter here (the OIIO/inherit-only
+# ones apply to documents, not the right to print).
+function Show-Permissions($sddl) {
+    foreach ($m in [regex]::Matches($sddl, '\(([^)]+)\)')) {
+        $f = $m.Groups[1].Value -split ';'
+        if ($f[1] -like '*IO*') { continue }           # inherit-only = document ACE
+        if ($f[5] -like 'S-1-15-3-*') { continue }      # app-container capability SIDs - noise
+        $who = switch ($f[5]) {
+            'WD' { 'Everyone' }             'BA' { 'Administrators' }
+            'BU' { 'Users' }                'AU' { 'Authenticated Users' }
+            'PU' { 'Power Users' }          'SY' { 'SYSTEM' }
+            'IU' { 'Interactive' }          'CO' { 'Creator Owner' }
+            default {
+                try { (New-Object Security.Principal.SecurityIdentifier $f[5]).Translate([Security.Principal.NTAccount]).Value }
+                catch { $f[5] }
+            }
+        }
+        $can = @()
+        if ($f[2] -match 'SW') { $can += 'Print' }
+        if ($f[2] -match 'DT') { $can += 'Manage documents' }
+        if ($f[2] -match 'LC') { $can += 'Manage printer' }
+        Write-Host ("      {0,-26} {1}" -f $who, ($can -join ', '))
+    }
+}
+
+
+# Resolve whatever was typed to a workable PC name. Accepts an IP (reverse-
+# resolved), a PC/host name (used as-is), or a staff name (looked up in the
+# share's sysinfo reports named <user>_<COMPUTER>_<ip>.txt).
+function Resolve-Pc($query) {
+    $q = $query.Trim()
+
+    if ($q -match '^\d{1,3}(\.\d{1,3}){3}$') {
+        try { $n = ([System.Net.Dns]::GetHostEntry($q)).HostName; return ($n -split '\.')[0] }
+        catch { Write-Warn "$q has no name in DNS - only the net-view fallback will work."; return $q }
+    }
+
+    # Looks like a hostname already? Use it.
+    if ($q -match '^[A-Za-z0-9\-]+$' -and $q -notmatch '^\d') {
+        # Could still be a staff name; try the reports only if DNS can't resolve it.
+        try { $null = [System.Net.Dns]::GetHostAddresses($q); return $q } catch { }
+    }
+
+    # Staff-name lookup needs the office reports share. Off a managed LAN (no
+    # ShareBase, e.g. the public build) there is nothing to look up - the query
+    # is used as-is.
+    if (-not $Site.ShareBase) { return $q }
+    $reportDir = Join-Path $Site.ShareBase 'reports\sysinfo'
+    if (Test-Path $reportDir) {
+        $esc = [regex]::Escape($q)
+        $files = @(Get-ChildItem $reportDir -Filter '*.txt' -File)
+        $match = $files | Where-Object { $_.BaseName -match "^$esc`_" } | Select-Object -First 1
+        if (-not $match) { $match = $files | Where-Object { $_.BaseName -like "*$q*" } | Select-Object -First 1 }
+        if ($match -and $match.BaseName -match '^(?<u>.+?)_(?<c>.+)_(?<ip>\d+\.\d+\.\d+\.\d+)$') {
+            Write-Host ("  {0}  ->  {1}" -f $matches.u, $matches.c) -ForegroundColor DarkGray
+            return $matches.c
+        }
+    }
+    return $q
+}
+
+
+Write-Head 'PRINTER INFO'
+$query = (Read-Host '  PC name, IP, or staff name').Trim()
+if (-not $query) { return }
+
+$pc = Resolve-Pc $query
+
+# ---------------------------------------------------------------------------
+#  REPORT LOG
+# ---------------------------------------------------------------------------
+#  File the result centrally, keyed on the PC that was LOOKED AT (not the PC we
+#  ran from), so reports\printer-info\ reads like a per-printer history. Falls
+#  back to TEMP if the share is unreachable, so a run is never lost.
+$reportName = "printer-info_{0}_{1}.txt" -f $pc, (Get-Date -Format 'yyyyMMdd_HHmmss')
+$reportDir  = if ($Site.ShareBase) { Join-Path $Site.ShareBase 'reports\printer-info' } else { Join-Path $env:TEMP 'printer-info' }
+try { New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction Stop | Out-Null }
+catch { $reportDir = Join-Path $env:TEMP 'printer-info'; New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction SilentlyContinue | Out-Null }
+$reportFile = Join-Path $reportDir $reportName
+try { Start-Transcript -Path $reportFile -Force -ErrorAction Stop | Out-Null } catch { $reportFile = $null }
+
+# Close the transcript and point at the file, from any exit path.
+function Complete-Report {
+    if ($script:reportFile) {
+        try { Stop-Transcript | Out-Null } catch { }
+        Write-Host ''
+        Write-Host "  Report saved:" -ForegroundColor DarkGray
+        Write-Host "    $script:reportFile" -ForegroundColor DarkGray
+        if ($script:reportFile -notlike '\\*') { Write-Host '    (share unreachable - saved locally)' -ForegroundColor DarkGray }
+    }
+}
+Write-Host ''
+Write-Host ("  target : {0}   ({1})" -f $pc,
+    $(if (Test-Connection $pc -Count 1 -Quiet) { 'online' } else { 'no ping - may be off' })) -ForegroundColor White
+
+$printers = @(Get-Printer -ComputerName $pc -Full -ErrorAction SilentlyContinue)
+if (-not $printers) {
+    # Spooler query refused or empty - fall back to net view, which at least
+    # gives the share names and the model in the comment column.
+    Write-Warn 'The print spooler would not answer (an IP, no rights, or firewall).'
+    Write-Warn 'Falling back to a share listing:'
+    & net.exe view "\\$pc" /all 2>&1 | Select-String '\s+Print\s+' | ForEach-Object { Write-Host "    $_" }
+    Complete-Report
+    return
+}
+
+# Physical printers first; the Win2PDF/OneNote/XPS/Fax noise is hidden unless
+# you ask (there is no place to pass a flag through iex, so it is just hidden).
+$soft = '^(nul:|PORTPROMPT:|SHRFAX:|PDFFILE:|FILE:|Microsoft\.Office)'
+$real = $printers | Where-Object { $_.PortName -notmatch $soft }
+
+Write-Sub 'PRINTERS'
+foreach ($p in $real) {
+    $flag = if ($p.Shared) { "SHARED as '$($p.ShareName)'" } else { 'not shared' }
+    Write-Host ("  {0}" -f $p.Name) -ForegroundColor Green
+    Write-Host ("      {0}  |  {1}  |  port {2}  |  {3}" -f $flag, $p.DriverName, $p.PortName, $p.PrinterStatus)
+}
+
+$shared = @($printers | Where-Object Shared)
+if ($shared) {
+    Write-Sub 'WHO CAN PRINT (shared only)'
+    foreach ($p in $shared) { Write-Host "  $($p.Name)"; Show-Permissions $p.PermissionSDDL }
+}
+
+Write-Sub 'STUCK / ERRORED JOBS'
+$jobs = foreach ($p in $printers) { Get-PrintJob -ComputerName $pc -PrinterName $p.Name }
+$bad  = $jobs | Where-Object { $_.JobStatus -match 'Error|Paused|Retained|Offline|Deleting' }
+if ($bad) { $bad | Select-Object PrinterName, Id, UserName, JobStatus, SubmittedTime | Format-Table -AutoSize }
+else      { Write-Host '  none' }
+Write-Host ("  ({0} job(s) queued in total)" -f @($jobs).Count) -ForegroundColor DarkGray
+
+Write-Sub 'PHYSICAL PORTS'
+Get-PrinterPort -ComputerName $pc |
+    Where-Object { $_.Name -match '^(USB|LPT|COM|\d{1,3}\.)' -or $_.PrinterHostAddress } |
+    Select-Object Name, PrinterHostAddress | Format-Table -AutoSize
+
+Write-Host ''
+Write-Host '  Tip: a port whose NAME is an IP but whose target address differs' -ForegroundColor DarkGray
+Write-Host '       means the printer moved - the queue still points at the old one.' -ForegroundColor DarkGray
+
+Complete-Report

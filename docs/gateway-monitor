@@ -1,0 +1,549 @@
+# =============================================================================
+#  gateway-monitor.ps1  -  Intermittent gateway connectivity diagnostic
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  Continuously pings the gateway and an internet target for a chosen
+#  duration, then captures supporting diagnostics:
+#    - Per-sample gateway ping (success/fail, latency)
+#    - ARP cache lookup for the gateway MAC
+#    - Traceroute to gateway + internet target
+#    - Pathping (per-hop loss) to gateway + internet target
+#    - Full ipconfig /all and route print snapshots
+#
+#  Result is a single plain-text report structured like a proper tech
+#  document - executive summary up top, raw data appendix at the bottom -
+#  so anyone (user or technician) can read it top-down without scrolling.
+#
+#  HOW TO RUN
+#  ----------
+#    irm <host>/gateway-monitor | iex
+#
+#  Defaults: gateway from site config (else this PC's default route), internet
+#  8.8.8.8, duration 5 min, every 2s. Run interactively without -DurationMinutes
+#  and you'll be prompted; unattended (scheduled task / SYSTEM) it uses 5 min.
+#
+#  To override defaults you have to download first (irm | iex can't pass args):
+#    gc <host>/gateway-monitor -Raw | Out-File "$env:TEMP\gw.ps1"
+#    & "$env:TEMP\gw.ps1" -GatewayIP 10.0.0.1 -DurationMinutes 15
+#
+#  WHAT IT SAVES
+#  -------------
+#    Local : Desktop\<user>_<PCNAME>_<ip>_<timestamp>.txt
+#    Server: <share>\reports\gateway-monitor\<same name>  (when on a managed LAN)
+#  Timestamp is included (unlike sysinfo) because multiple runs per PC are
+#  expected - one per incident.
+#
+#  SAFETY
+#  ------
+#  Read-only. The script only QUERIES the network - it doesn't change config.
+# =============================================================================
+
+[CmdletBinding()]
+param(
+    [string]$GatewayIP        = '',          # blank = use site config, else auto-detect
+    [string]$InternetIP       = '8.8.8.8',
+    [int]   $DurationMinutes  = 0,          # 0 = prompt if interactive, else default 5
+    [int]   $IntervalSeconds  = 2
+)
+
+# Lenient error handling: one failing ping or missing CIM class should NOT
+# kill the whole monitoring run.
+$ErrorActionPreference = 'SilentlyContinue'
+
+# <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
+$Site = @{
+    ShareRoot = ''
+    ShareBase = ''
+    Gateway   = ''
+    AdminHint = ''
+    PenMarker = 'network-tools'
+    ItUsers   = @()
+}
+# <#/SITE#>
+
+# The gateway to watch: what was passed, else the site default, else whatever
+# this PC's default route actually is (so it works on any LAN, unconfigured).
+if (-not $GatewayIP) { $GatewayIP = $Site.Gateway }
+if (-not $GatewayIP) {
+    $GatewayIP = (Get-NetIPConfiguration -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPv4DefaultGateway } |
+        Select-Object -First 1 -ExpandProperty IPv4DefaultGateway).NextHop
+}
+
+
+# ---------------------------------------------------------------------------
+#  IT EXCLUSION LIST  (from site config)
+# ---------------------------------------------------------------------------
+$itUsers        = $Site.ItUsers
+$systemProfiles = @('Default','Default User','Public','All Users','defaultuser0','WDAGUtilityAccount')
+
+
+# ---------------------------------------------------------------------------
+#  PRIMARY USER DETECTION  (mirrors sysinfo)
+# ---------------------------------------------------------------------------
+function Get-PrimaryUser {
+    $svc = @('SYSTEM','LOCALSYSTEM','LOCAL SERVICE','NETWORK SERVICE','DWM-1','UMFD-0','UMFD-1')
+    $u = $env:USERNAME
+    if ($u -and ($svc -notcontains $u.ToUpper()) -and
+        ($itUsers -notcontains $u.ToLower()) -and ($u -notmatch '\$$')) {
+        return $u
+    }
+    $candidates = Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($systemProfiles -notcontains $_.Name) -and ($_.Name -notmatch '^\.|\$$')
+        }
+    $scored = foreach ($p in $candidates) {
+        $folders = @(
+            (Join-Path $p.FullName 'Documents'),
+            (Join-Path $p.FullName 'Desktop'),
+            (Join-Path $p.FullName 'Downloads'),
+            (Join-Path $p.FullName 'OneDrive\Documents'),
+            (Join-Path $p.FullName 'OneDrive\Desktop')
+        )
+        $fileCount = 0; $latest = $null
+        foreach ($f in $folders) {
+            if (-not (Test-Path $f -ErrorAction SilentlyContinue)) { continue }
+            $items = Get-ChildItem $f -File -Depth 1 -Force -ErrorAction SilentlyContinue | Select-Object -First 500
+            $fileCount += @($items).Count
+            $maxDate = ($items | Measure-Object LastWriteTime -Maximum -ErrorAction SilentlyContinue).Maximum
+            if ($maxDate -and (-not $latest -or $maxDate -gt $latest)) { $latest = $maxDate }
+        }
+        $ntu = Join-Path $p.FullName 'NTUSER.DAT'
+        if (Test-Path $ntu -ErrorAction SilentlyContinue) {
+            $ntuDate = (Get-Item $ntu -Force -ErrorAction SilentlyContinue).LastWriteTime
+            if ($ntuDate -and (-not $latest -or $ntuDate -gt $latest)) { $latest = $ntuDate }
+        }
+        [pscustomobject]@{ Name = $p.Name; Files = $fileCount; Latest = $latest }
+    }
+    $ranked    = $scored | Sort-Object Files, Latest -Descending
+    $bestIt    = $ranked | Where-Object { $itUsers -contains $_.Name.ToLower() } | Select-Object -First 1
+    $bestNonIt = $ranked | Where-Object { $itUsers -notcontains $_.Name.ToLower() } | Select-Object -First 1
+    if (-not $bestIt -and -not $bestNonIt) { return 'unknown' }
+    if (-not $bestIt)    { return $bestNonIt.Name }
+    if (-not $bestNonIt) { return $bestIt.Name }
+    $ratio = if ($bestNonIt.Files -gt 0) { $bestIt.Files / $bestNonIt.Files } else { [double]::PositiveInfinity }
+    if ($ratio -ge 2) { return $bestIt.Name } else { return $bestNonIt.Name }
+}
+$primaryUser = Get-PrimaryUser
+
+
+# ---------------------------------------------------------------------------
+#  PRIMARY IP and route-bearing adapter info
+# ---------------------------------------------------------------------------
+$primaryIp = (Get-NetIPConfiguration |
+    Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
+    Select-Object -First 1).IPv4Address.IPAddress | Select-Object -First 1
+if (-not $primaryIp) { $primaryIp = 'no-ip' }
+
+$route   = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+    Sort-Object RouteMetric | Select-Object -First 1
+$ifAlias = 'Unknown'; $ifMac = 'Unknown'; $detectedGw = 'Unknown'
+if ($route) {
+    $detectedGw = $route.NextHop
+    $adapter    = Get-NetAdapter -InterfaceIndex $route.IfIndex -ErrorAction SilentlyContinue
+    if ($adapter) { $ifAlias = $adapter.Name; $ifMac = $adapter.MacAddress }
+}
+
+
+# ---------------------------------------------------------------------------
+#  DURATION  -  prompt if interactive + not provided, else default 5 min
+# ---------------------------------------------------------------------------
+if ($DurationMinutes -le 0) {
+    $interactive = [Environment]::UserInteractive -and $Host.Name -ne 'ServerRemoteHost'
+    if ($interactive) {
+        $entered = Read-Host "Monitoring duration in minutes (default 5)"
+        if ([string]::IsNullOrWhiteSpace($entered)) {
+            $DurationMinutes = 5
+        } elseif (-not [int]::TryParse($entered, [ref]$DurationMinutes) -or $DurationMinutes -le 0) {
+            Write-Host "Invalid duration - using 5 minutes." -ForegroundColor Yellow
+            $DurationMinutes = 5
+        }
+    } else {
+        $DurationMinutes = 5
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+#  OUTPUT PATHS
+# ---------------------------------------------------------------------------
+$timestamp  = Get-Date -Format 'yyyy-MM-dd_HHmm'
+$reportName = "{0}_{1}_{2}_{3}.txt" -f $primaryUser.ToLower(), $env:COMPUTERNAME.ToUpper(), $primaryIp.ToLower(), $timestamp
+$localDir   = Join-Path $env:USERPROFILE 'Desktop'
+if (-not (Test-Path $localDir)) { $localDir = $env:USERPROFILE }
+$localFile  = Join-Path $localDir $reportName
+# Each tool has its own subfolder under reports/ so connectivity reports
+# stay separate from other tools' output. Auto-created if missing.
+$shareDir   = if ($Site.ShareBase) { Join-Path $Site.ShareBase 'reports\gateway-monitor' } else { '' }
+
+# The server itself. Needed separately: if we have to authenticate with a
+# domain account, the session is opened against the SERVER, not against one
+# folder deep inside it.
+$shareRoot  = $Site.ShareRoot
+
+# --- The setup pen: a third home for the report ----------------------------
+#  Worth having precisely BECAUSE this tool runs when the network is sick -
+#  which is exactly when the share copy is most likely to fail.
+#
+#  The pen's DRIVE LETTER IS DIFFERENT ON EVERY PC, so it is never hard-coded.
+#  We find it by the marker folder we put on it: \network-tools\
+function Find-PenFolder {
+    # DriveType 2 = removable (a USB stick). Checked first.
+    # DriveType 3 = fixed - some USB3 sticks and dock-mounted drives report
+    # themselves this way, so they are checked as a fallback.
+    foreach ($driveType in 2, 3) {
+        $disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=$driveType" -ErrorAction SilentlyContinue
+        foreach ($d in $disks) {
+            $candidate = Join-Path "$($d.DeviceID)\" $Site.PenMarker
+            if (Test-Path $candidate) { return $candidate }
+        }
+    }
+    return $null   # pen not plugged in - that is fine, we just skip it
+}
+
+$penTools = Find-PenFolder
+$penDir   = if ($penTools) { Join-Path $penTools 'reports\gateway-monitor' } else { $null }
+
+
+# ---------------------------------------------------------------------------
+#  SYSTEM INFO  (collected once, used in header + report)
+# ---------------------------------------------------------------------------
+$cs = Get-CimInstance Win32_ComputerSystem
+$os = Get-CimInstance Win32_OperatingSystem
+
+
+# ---------------------------------------------------------------------------
+#  LIVE CONSOLE HEADER
+# ---------------------------------------------------------------------------
+$startDT = Get-Date
+$endDT   = $startDT.AddMinutes($DurationMinutes)
+
+Write-Host ""
+Write-Host ("=" * 70) -ForegroundColor Cyan
+Write-Host "  GATEWAY MONITOR  -  $($cs.Name)  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
+Write-Host ("=" * 70) -ForegroundColor Cyan
+Write-Host ("  User             : $primaryUser")
+Write-Host ("  Gateway          : $GatewayIP")
+Write-Host ("  Internet         : $InternetIP")
+Write-Host ("  Duration         : $DurationMinutes min  (interval $IntervalSeconds s)")
+Write-Host ("  Ends at          : " + $endDT.ToString('HH:mm:ss'))
+Write-Host ""
+
+
+# ---------------------------------------------------------------------------
+#  PING LOOP  (live console + sample records for the report)
+# ---------------------------------------------------------------------------
+Write-Host "Monitoring..." -ForegroundColor Cyan
+$samples = New-Object System.Collections.Generic.List[object]
+
+while ((Get-Date) -lt $endDT) {
+    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $status = 'Unreachable'; $latency = $null
+    try {
+        $reply = Test-Connection -ComputerName $GatewayIP -Count 1 -ErrorAction Stop
+        $status = 'Reachable'; $latency = [int]$reply.ResponseTime
+        Write-Host "$ts  $GatewayIP  Reachable ($latency ms)"
+    } catch {
+        Write-Host "$ts  $GatewayIP  Unreachable" -ForegroundColor Red
+    }
+    $samples.Add([pscustomobject]@{ time = $ts; status = $status; ms = $latency })
+    Start-Sleep -Seconds $IntervalSeconds
+}
+
+
+# ---------------------------------------------------------------------------
+#  COLLECT SUPPORTING DIAGNOSTICS
+# ---------------------------------------------------------------------------
+Write-Host ""
+Write-Host "Collecting diagnostics (arp, tracert x2, pathping x2, ipconfig, route)..." -ForegroundColor Cyan
+
+# ARP - prime cache, then read
+Test-Connection -ComputerName $GatewayIP -Count 1 -ErrorAction SilentlyContinue | Out-Null
+$arpLines = & arp -a 2>&1
+$arpRegex = "^\s*" + [regex]::Escape($GatewayIP) + "\s+([0-9A-Fa-f\-]{17})"
+$arpMatch = ($arpLines | Select-String -Pattern $arpRegex -AllMatches)
+$gwMac    = if ($arpMatch -and @($arpMatch.Matches).Count -gt 0) { $arpMatch.Matches[0].Groups[1].Value } else { $null }
+
+# Traceroute
+$traceGwLines  = & tracert $GatewayIP  2>&1
+$traceNetLines = & tracert $InternetIP 2>&1
+
+# Pathping (slowest step - 25 samples per hop)
+$pathGwLines  = & pathping -n -q 25 -p 100 $GatewayIP  2>&1
+$pathNetLines = & pathping -n -q 25 -p 100 $InternetIP 2>&1
+
+# Snapshot dumps
+$ipconfigLines = & ipconfig /all 2>&1
+$routeLines    = & route print   2>&1
+
+
+# ---------------------------------------------------------------------------
+#  COMPUTE STATS
+# ---------------------------------------------------------------------------
+$total   = $samples.Count
+$failed  = @($samples | Where-Object { $_.status -eq 'Unreachable' }).Count
+$success = $total - $failed
+$lossPct = if ($total -gt 0) { [Math]::Round(($failed / $total) * 100, 2) } else { 0 }
+$lat     = @($samples | Where-Object { $_.status -eq 'Reachable' -and $_.ms -ne $null } | ForEach-Object { [int]$_.ms })
+$minMs   = if ($lat.Count) { ($lat | Measure-Object -Minimum).Minimum } else { $null }
+$maxMs   = if ($lat.Count) { ($lat | Measure-Object -Maximum).Maximum } else { $null }
+$avgMs   = if ($lat.Count) { [Math]::Round(($lat | Measure-Object -Average).Average, 2) } else { $null }
+
+$result = if ($failed -gt 0) {
+    "ISSUE OBSERVED: $failed of $total samples failed ($lossPct% packet loss)."
+} else {
+    "OK: no connectivity issues observed during the monitoring window."
+}
+
+
+# ---------------------------------------------------------------------------
+#  BUILD REPORT  -  list of strings, written to file at the end so we can
+#                   control section order (summary first, raw data last).
+# ---------------------------------------------------------------------------
+$lines = New-Object System.Collections.Generic.List[string]
+# Note: reference $lines WITHOUT a scope modifier. .Add() is a mutation, so
+# PowerShell resolves $lines by walking up the scope chain - which works
+# whether the script is run directly or via the launcher's
+# & ([scriptblock]::Create(...)). Using $script: here breaks under the
+# launcher because $script: would point at the launcher's scope.
+function Add-Line { param([string]$text='') $lines.Add($text) | Out-Null }
+function Sec($title) {
+    Add-Line ''
+    Add-Line ('=' * 70)
+    Add-Line "  $title"
+    Add-Line ('=' * 70)
+}
+function Sub($title) {
+    Add-Line ''
+    Add-Line "--- $title ---"
+}
+function Lbl($label, $value, $col = 24) {
+    $v   = if ($null -eq $value) { '' } else { [string]$value }
+    $pre = "${label}:"
+    $pad = $col - $pre.Length; if ($pad -lt 1) { $pad = 1 }
+    Add-Line ($pre + (' ' * $pad) + $v)
+}
+
+# ---- Title block ----
+Add-Line ('=' * 70)
+Add-Line '  GATEWAY CONNECTIVITY DIAGNOSTICS REPORT'
+Add-Line ('=' * 70)
+Lbl 'Report Generated' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Lbl 'Computer'         $cs.Name
+Lbl 'User'             $primaryUser
+Lbl 'IP / MAC'         "$primaryIp  /  $ifMac"
+Lbl 'Interface'        $ifAlias
+
+# ---- 1. Executive summary (the answer at the top) ----
+Sec 'EXECUTIVE SUMMARY'
+Add-Line $result
+Add-Line ''
+Lbl 'Total samples'          $total
+Lbl 'Successful replies'     $success
+Lbl 'Unreachable events'     $failed
+Lbl 'Packet loss (%)'        $lossPct
+Lbl 'Latency min/avg/max ms' "$minMs / $avgMs / $maxMs"
+Lbl 'Gateway MAC (ARP)'      $gwMac
+
+# ---- 2. Test parameters (what was tested) ----
+Sec 'TEST PARAMETERS'
+Lbl 'Start time'      $startDT.ToString('yyyy-MM-dd HH:mm:ss')
+Lbl 'End time'        $endDT.ToString('yyyy-MM-dd HH:mm:ss')
+Lbl 'Duration (min)'  $DurationMinutes
+Lbl 'Interval (sec)'  $IntervalSeconds
+Lbl 'Gateway target'  $GatewayIP
+Lbl 'Internet target' $InternetIP
+
+# ---- 3. System info (where it ran) ----
+Sec 'SYSTEM INFORMATION'
+Lbl 'Computer name'   $cs.Name
+Lbl 'User'            $primaryUser
+Lbl 'IP address'      $primaryIp
+Lbl 'MAC address'     $ifMac
+Lbl 'Interface'       $ifAlias
+Lbl 'Detected gateway' $detectedGw
+Lbl 'OS'              "$($os.Caption) ($($os.Version)) build $($os.BuildNumber)"
+
+# ---- 4. Failure timestamps (the bit you actually want when there's a problem) ----
+Sec 'UNREACHABLE EVENTS'
+$fails = @($samples | Where-Object { $_.status -eq 'Unreachable' } | Select-Object -ExpandProperty time)
+if ($fails.Count -gt 0) {
+    Add-Line "$($fails.Count) sample(s) failed. Timestamps:"
+    Add-Line ''
+    $fails | ForEach-Object { Add-Line "  $_" }
+} else {
+    Add-Line 'None - the gateway responded to every sample.'
+}
+
+# ---- 5. ARP details ----
+Sec 'ARP CHECK'
+Lbl 'Gateway IP'  $GatewayIP
+Lbl 'Gateway MAC' $gwMac
+Sub 'Full output (arp -a)'
+$arpLines | ForEach-Object { Add-Line $_ }
+
+# ---- 6. Traceroute ----
+Sec "TRACEROUTE - GATEWAY ($GatewayIP)"
+$traceGwLines | ForEach-Object { Add-Line $_ }
+
+Sec "TRACEROUTE - INTERNET ($InternetIP)"
+$traceNetLines | ForEach-Object { Add-Line $_ }
+
+# ---- 7. Pathping (loss per hop) ----
+Sec "PATHPING - GATEWAY ($GatewayIP)"
+Add-Line "Command: pathping -n -q 25 -p 100 $GatewayIP"
+Add-Line ''
+$pathGwLines | ForEach-Object { Add-Line $_ }
+
+Sec "PATHPING - INTERNET ($InternetIP)"
+Add-Line "Command: pathping -n -q 25 -p 100 $InternetIP"
+Add-Line ''
+$pathNetLines | ForEach-Object { Add-Line $_ }
+
+# ---- 8. Full ping log (every sample - long but complete) ----
+Sec 'GATEWAY PING - FULL SAMPLE LOG'
+Add-Line "Total: $total samples (every $IntervalSeconds s for $DurationMinutes min)"
+Add-Line ''
+foreach ($s in $samples) {
+    $msPart = if ($s.ms -ne $null) { " ($($s.ms) ms)" } else { '' }
+    Add-Line ("{0}  {1}  {2}{3}" -f $s.time, $GatewayIP, $s.status, $msPart)
+}
+
+# ---- 9. Appendix: raw snapshots (rarely read, but archived) ----
+Sec 'APPENDIX A: IPCONFIG /ALL'
+$ipconfigLines | ForEach-Object { Add-Line $_ }
+
+Sec 'APPENDIX B: ROUTE PRINT'
+$routeLines | ForEach-Object { Add-Line $_ }
+
+# ---- Footer ----
+Add-Line ''
+Add-Line ('=' * 70)
+Add-Line "  End of report.  Generated by gateway-monitor.ps1"
+Add-Line ('=' * 70)
+
+
+# ---------------------------------------------------------------------------
+#  WRITE LOCAL FILE
+# ---------------------------------------------------------------------------
+$lines | Out-File -FilePath $localFile -Encoding UTF8
+
+Write-Host ""
+Write-Host ("=" * 70) -ForegroundColor Green
+Write-Host "  Monitoring complete.  $($cs.Name)  -  $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor Green
+Write-Host ("=" * 70) -ForegroundColor Green
+Write-Host ""
+# Assign the color first - Windows PowerShell 5.1 doesn't allow an inline
+# (if ...) expression directly in an argument position.
+$resultColor = if ($failed -gt 0) { 'Yellow' } else { 'Green' }
+Write-Host $result -ForegroundColor $resultColor
+Write-Host ""
+Write-Host "Local report : $localFile" -ForegroundColor White
+
+
+# ---------------------------------------------------------------------------
+#  COPY TO SHARE (graceful fallback if unreachable)
+# ---------------------------------------------------------------------------
+# No ShareBase (a PC off the managed LAN, or the public build) means there is no
+# server to copy to - the local report is the whole story. $shareDir is empty
+# then, and the whole share section is skipped.
+$shareOk = $false
+if ($shareDir) {
+    try {
+        if (-not (Test-Path $shareDir)) {
+            New-Item -ItemType Directory -Path $shareDir -Force -ErrorAction Stop | Out-Null
+        }
+        Copy-Item -Path $localFile -Destination (Join-Path $shareDir $reportName) -Force -ErrorAction Stop
+        $shareOk = $true
+    } catch {
+        $shareErr = $_.Exception.Message
+    }
+}
+
+# --- Attempt 2: borrow an AD account just for the copy ---------------------
+# The direct copy above works only when you are signed in as an AD (domain)
+# user. On a PC being set up under a LOCAL admin account it is refused by the
+# file server, which grants access to AD accounts only. So offer to
+# authenticate: New-PSDrive opens a session against the SERVER, after which the
+# ordinary UNC path works. The session is dropped again straight after.
+if (-not $shareOk -and $shareDir) {
+    Write-Host ""
+    Write-Host "Server copy  : FAILED  ($shareErr)" -ForegroundColor Yellow
+
+    $iAmDomainUser = (Get-CimInstance Win32_ComputerSystem).PartOfDomain -and
+                     ($env:USERDOMAIN -ne $env:COMPUTERNAME)
+
+    if (-not $iAmDomainUser) {
+        Write-Host "             : You are signed in as a LOCAL account ($env:USERDOMAIN\$env:USERNAME)." -ForegroundColor Yellow
+        Write-Host "             : The file server only accepts AD (domain) users." -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    $retry = Read-Host "  Send it to the server using a domain account? (y/n)"
+
+    if ($retry -eq 'y') {
+        $cred = Get-Credential -Message "Domain account with access to the file server (e.g. $($Site.AdminHint))"
+        if ($cred) {
+            try {
+                New-PSDrive -Name 'KDReports' -PSProvider FileSystem `
+                            -Root $shareRoot -Credential $cred -ErrorAction Stop | Out-Null
+                try {
+                    if (-not (Test-Path $shareDir)) {
+                        New-Item -ItemType Directory -Path $shareDir -Force -ErrorAction Stop | Out-Null
+                    }
+                    Copy-Item -Path $localFile -Destination (Join-Path $shareDir $reportName) `
+                              -Force -ErrorAction Stop
+                    $shareOk = $true
+                }
+                finally {
+                    Remove-PSDrive -Name 'KDReports' -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                Write-Host "  Still failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+    }
+}
+
+if ($shareOk) {
+    Write-Host "Server copy  : $shareDir\$reportName" -ForegroundColor Green
+} else {
+    Write-Host "Server copy  : not sent." -ForegroundColor Yellow
+}
+
+# --- Third copy: the setup pen, if it is plugged in ------------------------
+if ($penDir) {
+    try {
+        if (-not (Test-Path $penDir)) {
+            New-Item -ItemType Directory -Path $penDir -Force -ErrorAction Stop | Out-Null
+        }
+        Copy-Item -Path $localFile -Destination (Join-Path $penDir $reportName) -Force -ErrorAction Stop
+        Write-Host "Pen copy     : $penDir\$reportName" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Pen copy     : FAILED  ($($_.Exception.Message))" -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host "Pen copy     : skipped (setup pen not plugged in)" -ForegroundColor DarkGray
+}
+
+Write-Host ""
+if (-not $shareOk -and $penDir) {
+    Write-Host "The report is on the pen but NOT yet on the server." -ForegroundColor Cyan
+    Write-Host "Push it up later from any PC signed in as an AD user:" -ForegroundColor Cyan
+    Write-Host "    .\scripts\sync-pen-reports.ps1" -ForegroundColor White
+    Write-Host "  (or, from the pen itself:  <pen>\$($Site.PenMarker)\sync-pen-reports.ps1)" -ForegroundColor DarkGray
+}
+elseif (-not $shareOk -and -not $penDir) {
+    Write-Host "WARNING: this report exists ONLY on this PC's desktop." -ForegroundColor Red
+    Write-Host "         Plug the setup pen in and re-run, or copy it off by hand." -ForegroundColor Red
+}

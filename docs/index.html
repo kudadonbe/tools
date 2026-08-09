@@ -69,6 +69,36 @@
       <a href="wps-removal.html">Open WPS Removal Guide</a>
     </div>
 
+    <div class="tool-card">
+      <h2>Print Diagnostics</h2>
+      <p>Find out why printing to or from a PC is failing &mdash; reports the print/SMB hardening switches and the actual error codes. Read-only. Run as Administrator for the full picture.</p>
+      <code>irm https://kudadonbe.github.io/tools/print-diag | iex</code>
+    </div>
+
+    <div class="tool-card">
+      <h2>Clear Printer Spool</h2>
+      <p>Clear stuck print jobs &mdash; cancel one printer's queue, or a full spooler flush for a wedged job that won't cancel.</p>
+      <code>irm https://kudadonbe.github.io/tools/clearprinterspool | iex</code>
+    </div>
+
+    <div class="tool-card">
+      <h2>Printer Info</h2>
+      <p>Show a PC's printers from your own desk &mdash; share names, drivers, ports, who can print, and stuck jobs. Read-only.</p>
+      <code>irm https://kudadonbe.github.io/tools/printer-info | iex</code>
+    </div>
+
+    <div class="tool-card">
+      <h2>System Info</h2>
+      <p>A read-only inventory snapshot of a Windows PC &mdash; hardware, OS, network, disks, drivers &mdash; saved to a text report.</p>
+      <code>irm https://kudadonbe.github.io/tools/sysinfo | iex</code>
+    </div>
+
+    <div class="tool-card">
+      <h2>Gateway Monitor</h2>
+      <p>Connectivity diagnostic &mdash; watches the gateway and internet over time (ping, traceroute, pathping) and saves a report.</p>
+      <code>irm https://kudadonbe.github.io/tools/gateway-monitor | iex</code>
+    </div>
+
   </section>
 </body>
 </html>

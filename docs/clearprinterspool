@@ -1,0 +1,173 @@
+# =============================================================================
+#  clearprinterspool.ps1  -  Clear stuck print jobs
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  Clears jobs out of the Windows print queue, two ways:
+#
+#    1. One printer  - cancels that printer's jobs with Remove-PrintJob.
+#                      No service restart; the other printers keep working.
+#    2. Full flush   - stops the Spooler, deletes everything under
+#                      spool\PRINTERS, restarts it. This is the ONLY thing that
+#                      shifts a WEDGED job - one stuck "Error/Deleting" that
+#                      Remove-PrintJob cannot cancel - but it clears EVERY
+#                      printer's jobs on this PC, so it asks first.
+#
+#  This is a generic Windows tool - no network, domain or site detail. It works
+#  on any Windows PC.
+#
+#  HOW TO RUN
+#  ----------
+#     irm <host>/clearprinterspool | iex          (public)
+#  or from the pen / share menu, pick "clearprinterspool".
+#
+#  It is INTERACTIVE - it asks, it does not take parameters (they cannot be
+#  passed through iex).
+#
+#  SAFETY
+#  ------
+#  The full flush needs Administrator (it stops a service) and DELETES ALL
+#  queued jobs on this PC - it confirms before doing so. Clearing one printer
+#  needs only your own rights and touches only that printer.
+# =============================================================================
+
+$ErrorActionPreference = 'Continue'
+
+function Write-Head($text) {
+    Write-Host ''
+    Write-Host ('=' * 60) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 60) -ForegroundColor Cyan
+}
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+
+# ---------------------------------------------------------------------------
+#  ONE PRINTER  -  cancel just this printer's jobs
+# ---------------------------------------------------------------------------
+function Clear-OnePrinter {
+    Write-Head 'CLEAR ONE PRINTER'
+    $printers = @(Get-Printer -ErrorAction SilentlyContinue |
+        Sort-Object Name)
+    if (-not $printers) { Write-Warn 'No printers on this PC.'; return }
+
+    for ($i = 0; $i -lt $printers.Count; $i++) {
+        $n = @(Get-PrintJob -PrinterName $printers[$i].Name -ErrorAction SilentlyContinue).Count
+        $flag = if ($printers[$i].PrinterStatus -ne 'Normal') { "  [$($printers[$i].PrinterStatus)]" } else { '' }
+        Write-Host ("  {0,2}.  {1,-40} {2} job(s){3}" -f ($i + 1), $printers[$i].Name, $n, $flag)
+    }
+    Write-Host '   0.  back'
+    $pick = Read-Host '  Clear which printer'
+    if ($pick -eq '0' -or [string]::IsNullOrWhiteSpace($pick)) { return }
+
+    $idx = 0
+    if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $printers.Count) {
+        Write-Warn "Invalid choice: '$pick'"; return
+    }
+    $name = $printers[$idx - 1].Name
+
+    $jobs = @(Get-PrintJob -PrinterName $name -ErrorAction SilentlyContinue)
+    if (-not $jobs) { Write-Ok "'$name' already has no jobs."; return }
+
+    Write-Step "Cancelling $($jobs.Count) job(s) on '$name'..."
+    $jobs | Remove-PrintJob -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    $left = @(Get-PrintJob -PrinterName $name -ErrorAction SilentlyContinue)
+    if (-not $left) {
+        Write-Ok "'$name' queue cleared."
+    }
+    else {
+        Write-Warn "$($left.Count) job(s) would not cancel - they are WEDGED"
+        Write-Warn "(state: $($left[0].JobStatus))."
+        Write-Warn 'Only a full spooler flush shifts these - use option 2.'
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+#  FULL FLUSH  -  stop spooler, delete all spool files, start
+# ---------------------------------------------------------------------------
+function Clear-AllSpool {
+    Write-Head 'FULL SPOOLER FLUSH'
+
+    if (-not $isAdmin) {
+        Write-Bad 'The full flush needs Administrator (it stops the Spooler service).'
+        Write-Host '      Re-open Windows PowerShell with Run as administrator.' -ForegroundColor Yellow
+        return
+    }
+
+    $allJobs = @(Get-Printer -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-PrintJob -PrinterName $_.Name -ErrorAction SilentlyContinue })
+    Write-Warn "This deletes ALL $($allJobs.Count) queued job(s) on this PC, on every"
+    Write-Warn 'printer - not just the stuck one. In-progress prints are lost.'
+    $ans = Read-Host '  Type YES to flush the spooler'
+    if ($ans -ne 'YES') { Write-Host '  Cancelled.' -ForegroundColor DarkGray; return }
+
+    $spool = "$env:SystemRoot\System32\spool\PRINTERS"
+
+    Write-Step 'Stopping the Print Spooler...'
+    Stop-Service -Name Spooler -Force -ErrorAction SilentlyContinue
+    # Wait for it to actually stop before deleting, or the files are locked.
+    for ($i = 0; $i -lt 10 -and (Get-Service Spooler).Status -ne 'Stopped'; $i++) { Start-Sleep -Milliseconds 500 }
+
+    if ((Get-Service Spooler).Status -ne 'Stopped') {
+        Write-Bad 'The Spooler would not stop - nothing deleted.'
+        Start-Service -Name Spooler -ErrorAction SilentlyContinue
+        return
+    }
+
+    Write-Step "Deleting spool files in $spool ..."
+    $files = @(Get-ChildItem $spool -File -ErrorAction SilentlyContinue)
+    $files | Remove-Item -Force -ErrorAction SilentlyContinue
+
+    Write-Step 'Starting the Print Spooler...'
+    Start-Service -Name Spooler -ErrorAction SilentlyContinue
+
+    if ((Get-Service Spooler).Status -eq 'Running') {
+        Write-Ok "Spooler flushed and restarted ($($files.Count) file(s) removed)."
+    }
+    else {
+        Write-Bad 'Deleted the jobs but the Spooler did not restart - start it by hand:'
+        Write-Host '        Start-Service Spooler' -ForegroundColor Yellow
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+#  MENU
+# ---------------------------------------------------------------------------
+Write-Head 'CLEAR PRINTER SPOOL'
+Write-Host ("  This PC : {0}   ({1})" -f $env:COMPUTERNAME,
+    $(if ($isAdmin) { 'administrator' } else { 'not elevated - full flush unavailable' })) -ForegroundColor White
+
+while ($true) {
+    Write-Host ''
+    Write-Host '  What do you want to do?' -ForegroundColor White
+    Write-Host '   1.  Clear ONE printer''s jobs        (no restart, safe)'
+    Write-Host '   2.  Full spooler flush              (clears ALL, fixes wedged jobs, admin)'
+    Write-Host '   0.  exit'
+    $choice = Read-Host '  Choose'
+    switch ($choice) {
+        '1' { Clear-OnePrinter }
+        '2' { Clear-AllSpool }
+        '0' { break }
+        ''  { break }
+        default { Write-Warn "Invalid choice: '$choice'" }
+    }
+    if ($choice -eq '0' -or $choice -eq '') { break }
+}
+Write-Host '  Done.' -ForegroundColor Green

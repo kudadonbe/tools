@@ -1,0 +1,180 @@
+# =============================================================================
+#  print-diag.ps1  -  Why is printing to / from THIS PC failing?
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  Runs ON the PC you suspect - the one SHARING a printer (host), or one that
+#  fails to print to it (client) - and reports, read-only:
+#    - the print/SMB HARDENING switches the 2021-22 security updates delivered
+#      (the "PrintNightmare" era), which silently break sharing between a
+#      patched and an unpatched PC,
+#    - print-service and failed-logon events that name the actual error,
+#    - a verdict that flags the known-bad signatures (0x11b, 0x709, ...).
+#
+#  Changes nothing. Run it, read it, then decide.
+#
+#  HOW TO RUN
+#  ----------
+#  From the pen or share menu, pick "print-diag". Or directly:
+#     irm <host>/print-diag | iex
+#
+#  Run it AS ADMINISTRATOR to also see the Security log (who is being refused).
+#  Run it on the HOST (the PC that shares the printer) first - that is where a
+#  fleet-wide failure usually originates.
+# =============================================================================
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
+$Site = @{
+    ShareBase = ''
+}
+# <#/SITE#>
+
+function Head($t) { Write-Host ''; Write-Host "-- $t --" -ForegroundColor Cyan }
+function Flag($t) { Write-Host "  !! $t" -ForegroundColor Yellow }
+
+# ---------------------------------------------------------------------------
+#  REPORT LOG
+# ---------------------------------------------------------------------------
+#  Keep every run - a diagnostic you took the trouble to run on a remote PC is
+#  worth a record. Preferred home is the share (reports\print-diag\), so the
+#  result is filed centrally with the sysinfo reports; if the share is not
+#  reachable it falls back to TEMP so the run is never lost. Transcript, so the
+#  file is a plain mirror of exactly what is on screen.
+$reportName = "print-diag_{0}_{1}.txt" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss')
+# Prefer the office share; fall back to TEMP. With no ShareBase (a public build,
+# or a PC off the managed LAN) it just uses TEMP - the run is never lost.
+$reportDir = if ($Site.ShareBase) { Join-Path $Site.ShareBase 'reports\print-diag' } else { Join-Path $env:TEMP 'print-diag' }
+try { New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction Stop | Out-Null }
+catch { $reportDir = Join-Path $env:TEMP 'print-diag' ; New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction SilentlyContinue | Out-Null }
+$reportFile = Join-Path $reportDir $reportName
+try { Start-Transcript -Path $reportFile -Force -ErrorAction Stop | Out-Null } catch { $reportFile = $null }
+
+$os  = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$cs  = Get-CimInstance Win32_ComputerSystem
+$adm = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+       ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+Write-Host ('=' * 62) -ForegroundColor Cyan
+Write-Host ("  PRINT DIAG  {0}   {1} {2} (build {3}.{4})" -f $env:COMPUTERNAME, $os.ProductName, $os.DisplayVersion, $os.CurrentBuildNumber, $os.UBR)
+Write-Host ("  domain-joined: {0}   elevated: {1}" -f $cs.PartOfDomain, $adm)
+if (-not $adm) { Write-Host '  (not elevated - Security-log logon failures will be skipped)' -ForegroundColor DarkGray }
+Write-Host ('=' * 62) -ForegroundColor Cyan
+
+Head 'RECENT UPDATES'
+Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 5 |
+    ForEach-Object { Write-Host ("  {0}  {1}  {2:d}" -f $_.HotFixID, $_.Description, $_.InstalledOn) }
+
+Head 'PRINT HARDENING SWITCHES  (update-delivered)'
+function Show($path, $name, $note) {
+    $v = (Get-ItemProperty $path -Name $name).$name
+    $shown = if ($null -eq $v) { 'not set' } else { $v }
+    Write-Host ("  {0,-42} = {1,-8} {2}" -f $name, $shown, $note)
+    return $v
+}
+# HOST: since KB5005565 (Sep 2021) the spooler demands packet-privacy RPC unless
+# this is explicitly 0. Mismatched clients die with 0x0000011b - job spools then
+# vanishes, exactly the "prints once then stops" symptom.
+$rpcPriv = Show 'HKLM:\SYSTEM\CurrentControlSet\Control\Print' 'RpcAuthnLevelPrivacyEnabled' '(host) not set = ENFORCED since Sep 2021'
+# CLIENT: Win11 22H2+ prefers RPC-over-TCP to reach a shared printer.
+$null = Show 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\RPC' 'RpcUseNamedPipeProtocol' '(client) not set on Win11 22H2+ = RPC over TCP'
+# Point-and-Print (KB5005652): driver install needs admin unless relaxed.
+$pnp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+$null = Show $pnp 'RestrictDriverInstallationToAdministrators' '(client) not set = admin REQUIRED for P&P driver'
+$null = Show $pnp 'NoWarningNoElevationOnInstall'              '(client) 1 = no trust prompt'
+# SMB layer.
+$null = Show 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' 'AllowInsecureGuestAuth' '(client) not set/0 = guest access refused'
+$null = Show 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' 'RequireSecuritySignature' '(client) SMB signing required'
+$null = Show 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'      'RequireSecuritySignature' '(host)   SMB signing required'
+
+Head 'SPOOLER'
+$sp = Get-Service Spooler
+Write-Host ("  service: {0}   start: {1}" -f $sp.Status, $sp.StartType)
+$shared = @(Get-Printer | Where-Object Shared)
+foreach ($p in $shared) { Write-Host ("  sharing: '{0}' as '{1}'  ({2}, {3})" -f $p.Name, $p.ShareName, $p.PortName, $p.PrinterStatus) }
+if (-not $shared) { Write-Host '  this PC shares no printer' }
+
+Head 'PRINT EVENT LOG  (last 7 days)'
+$ev = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-PrintService/Admin'; StartTime=(Get-Date).AddDays(-7) } -MaxEvents 40 |
+      Where-Object { $_.LevelDisplayName -in 'Error','Warning' }
+if ($ev) {
+    $ev | Select-Object -First 15 | ForEach-Object {
+        Write-Host ("  {0:MM-dd HH:mm}  [{1}] {2}" -f $_.TimeCreated, $_.Id, ($_.Message -split "`r?`n")[0])
+    }
+} else { Write-Host '  no print errors/warnings logged (or the log is off)' }
+$op = Get-WinEvent -ListLog 'Microsoft-Windows-PrintService/Operational'
+Write-Host ("  Operational channel enabled: {0}" -f $op.IsEnabled)
+if (-not $op.IsEnabled) { Write-Host '  (enable it in Event Viewer, reproduce the print, re-run for per-job detail)' -ForegroundColor DarkGray }
+
+$logonFails = @()
+if ($adm) {
+    Head 'FAILED NETWORK LOGONS  (Security log, last 2 days)'
+    # Decode the sub-status - it says WHY, and that decides the fix.
+    $why = @{
+        '0xc0000064' = 'no such user (a LOCAL account presented to a domain host)'
+        '0xc000006a' = 'wrong password'
+        '0xc0000234' = 'account locked out'
+        '0xc0000072' = 'account disabled'
+        '0xc0000070' = 'workstation restriction'
+        '0xc000006f' = 'outside permitted logon hours'
+        '0xc0000193' = 'account expired'
+        '0xc0000371' = 'no stored credential (local account has no secrets)'
+    }
+    $fail = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4625; StartTime=(Get-Date).AddDays(-2) } -MaxEvents 15
+    if ($fail) {
+        foreach ($f in $fail) {
+            $x = [xml]$f.ToXml(); $d = @{}; $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }
+            $sub = ($d.SubStatus).ToLower()
+            $logonFails += [pscustomobject]@{ User = "$($d.TargetDomainName)\$($d.TargetUserName)"; From = $d.IpAddress; Sub = $sub }
+            Write-Host ("  {0:MM-dd HH:mm}  {1}\{2}  from {3}  {4}  {5}" -f $f.TimeCreated, $d.TargetDomainName, $d.TargetUserName, $d.IpAddress, $sub, $why[$sub])
+        }
+    } else { Write-Host '  none' }
+}
+
+Head 'VERDICT HINTS'
+# Ordered by weight of evidence: an actual logged error or failure first, the
+# mere-configuration observations last (a default switch is NOT a fault on its
+# own - it only bites a MISMATCHED peer, and the log is what proves that).
+$known = @()
+$msgs  = ($ev | ForEach-Object { $_.Message }) -join ' '
+
+# --- hard evidence: things that actually failed --------------------------
+if ($logonFails) {
+    $noUser = $logonFails | Where-Object { $_.Sub -eq '0xc0000064' }
+    if ($noUser) {
+        $src = ($noUser.From | Sort-Object -Unique) -join ', '
+        $known += "AUTH FAILURE (0xc0000064) from $src - a LOCAL account was presented to this " +
+                  "domain host and rejected as 'no such user'. That PC is WORKGROUP and printing " +
+                  "leaked its local identity. Fix: store a domain credential for BOTH the IP and " +
+                  "the hostname on that PC (add-printer does this, and it must PERSIST), or join it " +
+                  "to the domain. This is NOT a Windows-update problem."
+    }
+    $badPw = $logonFails | Where-Object { $_.Sub -eq '0xc000006a' }
+    if ($badPw) { $known += 'AUTH FAILURE (0xc000006a) - a stored credential has the wrong password. Update the cmdkey entry.' }
+}
+if ($msgs -match '0x0000011b')            { $known += '0x0000011b LOGGED -> RPC packet-privacy mismatch (KB5005565 class). Fix: patch BOTH sides to current builds; RpcAuthnLevelPrivacyEnabled=0 on the host is a DIAGNOSIS-ONLY test that re-opens the CVE.' }
+if ($msgs -match '0x00000709')            { $known += '0x00000709 LOGGED -> name / default-printer conflict, or GP adding a queue that has moved (check the target with printer-info).' }
+if ($msgs -match '0x0000007c|0x00000bcb') { $known += 'driver-fetch error LOGGED -> Point-and-Print restriction; stage the driver locally instead (add-printer does this).' }
+
+# --- configuration observations: only a hint, never a verdict on their own -
+if (-not $known) {
+    if ($null -eq $rpcPriv -and $shared) { $known += 'Observation only (no print errors logged): this host enforces RPC packet privacy, the DEFAULT. It bites only an old/unpatched CLIENT - look for 0x0000011b in THAT client log before concluding.' }
+    if ($cs.PartOfDomain -eq $false)     { $known += 'Observation only: this is a workgroup PC, so its jobs to domain hosts ride on the per-user cmdkey credential add-printer stores. If printing fails, run this on the HOST as admin and read the failed-logon section.' }
+    if (-not $known) { $known = @('nothing conclusive - no print errors and no failed logons in the window. Enable the Operational channel, reproduce the failing print, re-run.') }
+}
+$known | ForEach-Object { Flag $_ }
+Write-Host ''
+
+if ($reportFile) {
+    try { Stop-Transcript | Out-Null } catch { }
+    Write-Host "  Report saved:" -ForegroundColor DarkGray
+    Write-Host "    $reportFile" -ForegroundColor DarkGray
+    if ($reportFile -notlike '\\*') { Write-Host '    (share was unreachable - saved locally instead)' -ForegroundColor DarkGray }
+}

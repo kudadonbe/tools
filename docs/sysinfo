@@ -1,0 +1,700 @@
+# =============================================================================
+#  sysinfo.ps1  -  PC health & inventory snapshot
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  Collects a one-page report on the PC it runs on:
+#    - System ID  (make, model, serial, OS, uptime)
+#    - CPU        (cores, speed)
+#    - Memory     (total/used/free + per-DIMM details)
+#    - Storage    (physical disks + volumes with free space %)
+#    - GPU        (display adapter + driver version)
+#    - Network    (adapters, IPv4/gateway/DNS, public IP)
+#    - Devices    (USB peripherals, monitors via EDID, printers)
+#    - Drivers    (problem devices + 10 newest installed drivers)
+#    - Software   (last 15 installed apps)
+#    - Battery    (laptops only)
+#    - Processes  (top 10 by memory usage)
+#
+#  HOW TO RUN
+#  ----------
+#  From any PC, open PowerShell and paste either:
+#
+#     irm <host>/sysinfo | iex
+#
+#  or if the one-liner above fails on older systems:
+#
+#     iex (gc <host>/sysinfo -Raw)
+#
+#  WHAT IT SAVES
+#  -------------
+#  The report is written to up to THREE places:
+#    1. Local PC:   Desktop\<user>_<PCNAME>_<ip>.txt                (always)
+#    2. Server:     <share>\reports\sysinfo\                        (on a managed LAN)
+#    3. Setup pen:  <pen>\<marker>\reports\sysinfo\                 (if plugged in)
+#
+#  The pen copy is the one that saves you on a NEW PC: until the network is
+#  configured the server copy cannot work, and without the pen the only record
+#  is a file on a machine you are about to walk away from.
+#
+#  The pen's drive letter is found automatically (it differs on every PC) by
+#  looking for the pen-marker folder on it - see Find-PenFolder below.
+#
+#  SAFETY
+#  ------
+#  Read-only. The script only QUERIES the system - it doesn't change anything.
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+#  GLOBAL ERROR BEHAVIOR
+# ---------------------------------------------------------------------------
+#  Some queries (e.g. WMI calls on locked-down PCs) may throw errors.
+#  'SilentlyContinue' tells PowerShell: skip the failing command, keep going.
+#  That way one missing piece doesn't abort the whole scan.
+$ErrorActionPreference = 'SilentlyContinue'
+
+
+# ---------------------------------------------------------------------------
+#  OUTPUT FILE SETUP
+# ---------------------------------------------------------------------------
+#  Filename pattern:  <user>_<COMPUTERNAME>_<ip>.txt
+#                     (user + ip lowercase, PC name uppercase)
+#  Example:           jdoe_OFFICE-PC-12_10.0.0.42.txt
+#
+#  Why this order: sorting the folder groups files by USER, so you can see
+#  at a glance which PCs each person uses. The full read is natural English:
+#  "jdoe's OFFICE-PC-12 at 10.0.0.42".
+#
+#  Same PC will overwrite its own report on re-run (latest snapshot wins).
+#  Different PCs cannot collide because each one has a unique IP/name combo.
+
+# --- Primary IPv4 --------------------------------------------------------
+# Pick the adapter that has a default gateway (i.e. the route the PC actually
+# uses to reach the network).
+#
+# An adapter can hold SEVERAL IPv4 addresses, and taking the first one is not
+# safe: a multi-homed PC can answer on several subnets at once, and Windows
+# does not list them in any useful order.
+# Filing the report under the wrong one puts the PC in the wrong place in the
+# inventory - or drops it out entirely, and frees an address that is in use.
+#
+# So: of the addresses on that adapter, prefer the one on the OFFICE subnet.
+# Fall back to the first address only if the PC genuinely has none.
+
+# <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
+$Site = @{
+    ShareRoot = ''
+    ShareBase = ''
+    Subnet    = ''
+    AdminHint = ''
+    PenMarker = 'network-tools'
+    ItUsers   = @()
+}
+# <#/SITE#>
+
+# Empty subnet (public build / unmanaged LAN) matches everything, so the PC's
+# gateway adapter address is just taken as-is.
+$officePrefix = if ($Site.Subnet) { $Site.Subnet + '.' } else { '' }
+
+$addresses = @(Get-NetIPConfiguration |
+    Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
+    Select-Object -First 1 |
+    ForEach-Object { $_.IPv4Address.IPAddress })
+
+$primaryIp = @($addresses | Where-Object { $_ -like "$officePrefix*" })[0]
+if (-not $primaryIp) { $primaryIp = @($addresses)[0] }
+if (-not $primaryIp) { $primaryIp = 'no-ip' }
+
+# --- Primary user --------------------------------------------------------
+# Goal: find the REAL OWNER of this PC, not whoever happens to be running
+# the script. Two problem cases to solve:
+#   a) Script runs as SYSTEM (Action1 / scheduled task) - $env:USERNAME is
+#      'SYSTEM' which tells us nothing.
+#   b) An IT person logs in to run the script interactively - $env:USERNAME
+#      is the IT person, not the PC's actual owner.
+#
+# Strategy:
+#   1. If $env:USERNAME is a real user AND not in the IT list -> use it.
+#   2. Else scan C:\Users, skip built-ins and IT users, pick the most
+#      active profile based on Documents/Desktop/Downloads activity.
+#
+# To exclude additional IT staff later, just add their account name to
+# the $itUsers list below (case-insensitive).
+$itUsers = $Site.ItUsers
+
+# Built-in Windows profile folders to always skip when scanning C:\Users.
+$systemProfiles = @('Default','Default User','Public','All Users','defaultuser0',
+                    'WDAGUtilityAccount')
+
+function Get-PrimaryUser {
+    # THE RULE: the most RECENTLY ACTIVE user owns the PC.
+    #
+    # Not "whoever is logged in" - that hands the PC to a relief staff member
+    # who happened to be at the desk during the scan.
+    #
+    # Not "whoever has the most files" either. That was the old rule, and it
+    # gets a reassigned PC permanently wrong: a leaver with 3,000 stale
+    # documents outranks the new owner with 40 fresh ones, forever.
+    #
+    # So we rank by the LAST TIME the person actually did work - the newest
+    # write in their Documents / Desktop / Downloads. File count survives only
+    # as a tiebreak, and to prove a profile is real rather than a single logon.
+    #
+    # THE TRAP: NTUSER.DAT is rewritten on every logon, so the IT person
+    # running this scan ALWAYS has the freshest one. Ranking on it would hand
+    # every PC in the office to whoever did the scanning. It is therefore used
+    # ONLY as a fallback, never as the recency signal - see below.
+
+    $svc = @('SYSTEM','LOCALSYSTEM','LOCAL SERVICE','NETWORK SERVICE','DWM-1','UMFD-0','UMFD-1')
+    $me  = $env:USERNAME
+
+    $candidates = Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            $name = $_.Name
+            ($systemProfiles -notcontains $name) -and
+            ($name -notmatch '^\.|\$$') -and
+            ($svc -notcontains $name.ToUpper())
+        }
+
+    $scored = foreach ($p in $candidates) {
+        $folders = @(
+            (Join-Path $p.FullName 'Documents'),
+            (Join-Path $p.FullName 'Desktop'),
+            (Join-Path $p.FullName 'Downloads'),
+            (Join-Path $p.FullName 'OneDrive\Documents'),
+            (Join-Path $p.FullName 'OneDrive\Desktop')
+        )
+
+        $fileCount = 0
+        $docLatest = $null      # real work: newest write in the doc folders
+        foreach ($f in $folders) {
+            # NTFS denies other users' Documents unless we are admin. Skip
+            # quietly - that case is handled by the fallback further down.
+            if (-not (Test-Path $f -ErrorAction SilentlyContinue)) { continue }
+            $items = Get-ChildItem $f -File -Depth 1 -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 500
+            $fileCount += @($items).Count
+            $maxDate = ($items | Measure-Object LastWriteTime -Maximum -ErrorAction SilentlyContinue).Maximum
+            if ($maxDate -and (-not $docLatest -or $maxDate -gt $docLatest)) { $docLatest = $maxDate }
+        }
+
+        # Logon time. Kept SEPARATE from $docLatest, and deliberately never
+        # mixed into it - see THE TRAP above.
+        $loginLatest = $null
+        $ntu = Join-Path $p.FullName 'NTUSER.DAT'
+        if (Test-Path $ntu -ErrorAction SilentlyContinue) {
+            $loginLatest = (Get-Item $ntu -Force -ErrorAction SilentlyContinue).LastWriteTime
+        }
+
+        [pscustomobject]@{
+            Name        = $p.Name
+            Files       = $fileCount
+            DocLatest   = $docLatest
+            LoginLatest = $loginLatest
+            IsIT        = ($itUsers -contains $p.Name.ToLower())
+        }
+    }
+
+    if (-not $scored) { return 'unknown' }
+
+    # --- Rank by real work: most recent document activity first -------------
+    $active    = @($scored | Where-Object { $_.Files -gt 0 -and $_.DocLatest })
+    $ranked    = @($active | Sort-Object DocLatest, Files -Descending)
+    $bestNonIt = @($ranked | Where-Object { -not $_.IsIT }) | Select-Object -First 1
+    $bestIt    = @($ranked | Where-Object { $_.IsIT })      | Select-Object -First 1
+
+    if ($bestNonIt) {
+        # An IT profile only takes the PC off a real user if it is plainly IT's
+        # OWN workstation: more recent work AND at least twice the files.
+        if ($bestIt -and
+            $bestIt.DocLatest -gt $bestNonIt.DocLatest -and
+            $bestIt.Files -ge (2 * [Math]::Max($bestNonIt.Files, 1))) {
+            return $bestIt.Name
+        }
+        return $bestNonIt.Name
+    }
+
+    if ($bestIt) { return $bestIt.Name }   # only IT has ever worked here
+
+    # --- Fallback: no document activity was readable ------------------------
+    # We are running as a normal user, so NTFS hid everyone else's Documents.
+    # The only signals left are who is logged in, and logon times.
+    if ($me -and ($itUsers -notcontains $me.ToLower()) -and ($me -notmatch '\$$')) {
+        return $me
+    }
+
+    # Logged in as IT. Fall back to the non-IT profile with the newest logon.
+    # Not as good as document activity, but it beats naming the PC after IT.
+    $byLogin = @($scored | Where-Object { -not $_.IsIT -and $_.LoginLatest } |
+                 Sort-Object LoginLatest -Descending) | Select-Object -First 1
+    if ($byLogin) { return $byLogin.Name }
+
+    if ($me) { return $me }
+    return 'unknown'
+}
+$primaryUser = Get-PrimaryUser
+
+# User and IP lowercase; PC name uppercase (matches Windows convention,
+# gives the filename a visual hierarchy: who_WHAT_where).
+$reportName = "{0}_{1}_{2}.txt" -f $primaryUser.ToLower(), $env:COMPUTERNAME.ToUpper(), $primaryIp.ToLower()
+
+# Prefer the Desktop (visible to the user). If it doesn't exist (rare),
+# fall back to the user's profile root.
+$localDir  = Join-Path $env:USERPROFILE 'Desktop'
+if (-not (Test-Path $localDir)) { $localDir = $env:USERPROFILE }
+$localFile = Join-Path $localDir $reportName
+
+# Where on the share we drop copies. Each tool has its own subfolder under
+# reports/ so PC inventory snapshots don't get mixed in with other tools'
+# output. The script auto-creates this folder if it doesn't exist.
+$shareDir  = if ($Site.ShareBase) { Join-Path $Site.ShareBase 'reports\sysinfo' } else { '' }
+
+# The server itself. Needed separately: if we have to authenticate with a
+# domain account (see below), the session is opened against the SERVER, not
+# against one folder deep inside it.
+$shareRoot = $Site.ShareRoot
+
+
+# ---------------------------------------------------------------------------
+#  FIND THE SETUP PEN  (third copy of the report)
+# ---------------------------------------------------------------------------
+#  On a PC that is not on the network yet, the share copy fails and the only
+#  record is a file on that PC's desktop - which you then have to go back for.
+#  So we also drop a copy on the pen, and you carry the reports home with you.
+#
+#  The pen's DRIVE LETTER IS DIFFERENT ON EVERY PC, so it is never hard-coded.
+#  We look for the marker folder we put on it - \network-tools\ - which means
+#  detection also survives the pen being re-imaged or relabelled.
+# ---------------------------------------------------------------------------
+function Find-PenFolder {
+    # DriveType 2 = removable (a USB stick). Checked first.
+    # DriveType 3 = fixed - some USB3 sticks and dock-mounted drives report
+    # themselves this way, so they are checked as a fallback.
+    foreach ($driveType in 2, 3) {
+        $disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=$driveType" -ErrorAction SilentlyContinue
+        foreach ($d in $disks) {
+            $candidate = Join-Path "$($d.DeviceID)\" $Site.PenMarker
+            if (Test-Path $candidate) { return $candidate }
+        }
+    }
+    return $null   # pen not plugged in - that is fine, we just skip it
+}
+
+$penTools = Find-PenFolder
+$penDir   = if ($penTools) { Join-Path $penTools 'reports\sysinfo' } else { $null }
+
+# Start-Transcript captures EVERYTHING shown in the console (including
+# Write-Host text) and writes it to a file in real time. The screen still
+# shows colored output - the file just gets a plain-text mirror.
+Start-Transcript -Path $localFile -Force | Out-Null
+
+
+# ---------------------------------------------------------------------------
+#  PRETTY-PRINT HELPERS
+# ---------------------------------------------------------------------------
+#  Two small functions so each section starts with a clear banner.
+#  Using Write-Host (vs Write-Output) because we want colors and we don't
+#  want this decorative text polluting the pipeline.
+
+function Write-Section($title) {
+    Write-Host ""
+    Write-Host ("=" * 70) -ForegroundColor Cyan           # 70-char line of '='
+    Write-Host "  $title" -ForegroundColor Cyan
+    Write-Host ("=" * 70) -ForegroundColor Cyan
+}
+
+function Write-Sub($title) {
+    Write-Host ""
+    Write-Host "--- $title ---" -ForegroundColor Yellow
+}
+
+
+# ---------------------------------------------------------------------------
+#  HEADER  -  basic identity of the machine
+# ---------------------------------------------------------------------------
+#  Get-CimInstance is the modern way to query WMI (the Windows Management
+#  Instrumentation database). It returns rich objects you can pipe further.
+#  We pull three classes here and reuse them later to avoid duplicate queries:
+#    - Win32_ComputerSystem  : name, manufacturer, model, total RAM
+#    - Win32_OperatingSystem : OS version, last boot, free RAM
+#    - Win32_BIOS            : serial number, BIOS version
+$cs   = Get-CimInstance Win32_ComputerSystem
+$os   = Get-CimInstance Win32_OperatingSystem
+$bios = Get-CimInstance Win32_BIOS
+
+Write-Section "SYSTEM SNAPSHOT  -  $($cs.Name)  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+
+# [pscustomobject]@{...} builds an ad-hoc object with the fields we want.
+# Piping it to Format-List prints one "Key : Value" per line.
+[pscustomobject]@{
+    ComputerName = $cs.Name
+    User         = "$($cs.UserName)"                                   # currently logged-in user
+    Domain       = $cs.Domain
+    Manufacturer = $cs.Manufacturer
+    Model        = $cs.Model
+    Serial       = $bios.SerialNumber
+    BIOSVersion  = $bios.SMBIOSBIOSVersion
+    OS           = "$($os.Caption) ($($os.Version)) $($os.OSArchitecture)"
+    InstallDate  = $os.InstallDate
+    LastBoot     = $os.LastBootUpTime
+    # New-TimeSpan = (LastBoot - Now). ToString('d\.hh\:mm') = "days.hh:mm"
+    Uptime       = (New-TimeSpan -Start $os.LastBootUpTime -End (Get-Date)).ToString('d\.hh\:mm')
+} | Format-List
+
+
+# ---------------------------------------------------------------------------
+#  CPU
+# ---------------------------------------------------------------------------
+#  Win32_Processor returns one object per CPU socket.
+#  The funny @{n='...';e={...}} syntax is a "calculated property" - it lets
+#  us add or rename columns. Here we convert MHz to GHz on the fly.
+Write-Section "CPU"
+Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors,
+    @{n='MaxClockGHz';e={[math]::Round($_.MaxClockSpeed/1000,2)}},
+    SocketDesignation, Manufacturer | Format-List
+
+
+# ---------------------------------------------------------------------------
+#  MEMORY
+# ---------------------------------------------------------------------------
+#  Two layers:
+#    1. Overall total/used/free (a quick summary line).
+#    2. Per-DIMM breakdown (slot, speed, capacity) - useful when planning
+#       upgrades or diagnosing single-channel vs dual-channel issues.
+#
+#  Note: TotalPhysicalMemory is in BYTES, FreePhysicalMemory is in KILOBYTES.
+#  PowerShell's '1GB' and '1MB' are real constants (1073741824 and 1048576).
+Write-Section "MEMORY"
+$totalGB = [math]::Round($cs.TotalPhysicalMemory/1GB,2)
+$freeGB  = [math]::Round($os.FreePhysicalMemory/1MB,2)             # KB / 1MB = GB? No: KB*1024/1MB = MB; here OS gives KB and /1MB gives GB
+$usedGB  = [math]::Round($totalGB - $freeGB,2)
+$pct     = [math]::Round(($usedGB / $totalGB) * 100,1)
+Write-Host "Total : $totalGB GB"
+Write-Host "Used  : $usedGB GB  ($pct%)"
+Write-Host "Free  : $freeGB GB"
+
+Write-Sub "DIMMs installed"
+# Win32_PhysicalMemory = one row per physical RAM stick.
+Get-CimInstance Win32_PhysicalMemory | Select-Object @{n='Slot';e={$_.DeviceLocator}},
+    Manufacturer, PartNumber,
+    @{n='SizeGB';e={[math]::Round($_.Capacity/1GB,2)}},
+    @{n='SpeedMHz';e={$_.ConfiguredClockSpeed}} | Format-Table -AutoSize
+
+
+# ---------------------------------------------------------------------------
+#  STORAGE
+# ---------------------------------------------------------------------------
+#  Two views again:
+#    1. Get-PhysicalDisk - the actual hardware (SSD vs HDD, bus type, health).
+#    2. Get-Volume       - the partitions/drive letters and their free space.
+Write-Section "STORAGE"
+
+Write-Sub "Physical disks"
+Get-PhysicalDisk | Select-Object DeviceId, FriendlyName, MediaType, BusType,
+    @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},
+    HealthStatus, OperationalStatus | Format-Table -AutoSize
+
+Write-Sub "Volumes"
+# Where-Object DriveLetter   -> filter out volumes without a letter (recovery partitions, system reserved)
+# Sort-Object  DriveLetter   -> show C: D: E: in order
+Get-Volume | Where-Object DriveLetter | Sort-Object DriveLetter |
+    Select-Object DriveLetter, FileSystemLabel, FileSystem, DriveType,
+        @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},
+        @{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}},
+        # Free% guard: avoid divide-by-zero on empty/unmounted volumes
+        @{n='Free%';e={if($_.Size){[math]::Round(($_.SizeRemaining/$_.Size)*100,1)}}},
+        HealthStatus | Format-Table -AutoSize
+
+
+# ---------------------------------------------------------------------------
+#  GPU / DISPLAY
+# ---------------------------------------------------------------------------
+#  Win32_VideoController returns one row per display adapter.
+#  Laptops with hybrid graphics (Intel + NVIDIA) will show two entries.
+Write-Section "GPU / DISPLAY"
+Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion,
+    @{n='VRAM_GB';e={[math]::Round($_.AdapterRAM/1GB,2)}},
+    VideoModeDescription | Format-List
+
+
+# ---------------------------------------------------------------------------
+#  NETWORK
+# ---------------------------------------------------------------------------
+#  Three sub-sections:
+#    1. Active adapters - MAC, link speed (handy to confirm it's gig vs 100M).
+#    2. IP configuration - IPv4, gateway, DNS per active interface.
+#    3. Public IP - what the internet sees this PC as (requires outbound HTTPS).
+Write-Section "NETWORK"
+
+Write-Sub "Active adapters"
+# 'Status -eq Up' filters out disconnected/disabled adapters.
+Get-NetAdapter | Where-Object Status -eq 'Up' |
+    Select-Object Name, InterfaceDescription, MacAddress, LinkSpeed | Format-Table -AutoSize
+
+Write-Sub "IP configuration"
+Get-NetIPConfiguration | Where-Object { $_.NetAdapter.Status -eq 'Up' } |
+    Select-Object InterfaceAlias,
+        @{n='IPv4';e={($_.IPv4Address.IPAddress -join ', ')}},
+        @{n='Gateway';e={$_.IPv4DefaultGateway.NextHop}},
+        # AddressFamily 2 = IPv4 (vs 23 = IPv6). We only want IPv4 DNS here.
+        @{n='DNS';e={($_.DNSServer | Where-Object AddressFamily -eq 2).ServerAddresses -join ', '}} |
+    Format-List
+
+Write-Sub "Public IP"
+# ipify.org is a free no-auth service that returns just your public IPv4.
+# TimeoutSec 5 = don't hang the whole script if the internet is down.
+try {
+    $pub = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 5)
+    Write-Host $pub
+} catch { Write-Host "(unavailable)" }
+
+
+# ---------------------------------------------------------------------------
+#  CONNECTED DEVICES  -  USB peripherals, monitors, printers
+# ---------------------------------------------------------------------------
+Write-Section "CONNECTED DEVICES"
+
+Write-Sub "USB devices"
+# Get-PnpDevice = all Plug-and-Play devices known to Windows.
+#   -PresentOnly       : only currently connected (skip "ghost" past devices)
+#   InstanceId -like 'USB*' : only devices on the USB bus
+Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB*' -and $_.Class -ne $null } |
+    Sort-Object Class, FriendlyName |
+    Select-Object Class, FriendlyName, Status | Format-Table -AutoSize
+
+Write-Sub "Monitors"
+# Monitors report their identity via EDID (a small block embedded in the
+# cable signal). Windows exposes it through WmiMonitorID in root/wmi.
+# The fields come as arrays of bytes (each byte = one ASCII character code),
+# with trailing zeros for padding. We:
+#   1. Drop the zero bytes (Where-Object {$_ -ne 0})
+#   2. Convert each remaining byte to a character ([char]$_)
+#   3. Join them into a string (-join ...)
+Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {
+    [pscustomobject]@{
+        Manufacturer = -join ($_.ManufacturerName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })
+        Model        = -join ($_.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })
+        Serial       = -join ($_.SerialNumberID   | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ })
+        Year         = $_.YearOfManufacture
+    }
+} | Format-Table -AutoSize
+
+Write-Sub "Printers"
+Get-Printer | Select-Object Name, ShareName, DriverName, PortName, Shared, Default | Format-Table -AutoSize
+
+
+# ---------------------------------------------------------------------------
+#  DRIVERS
+# ---------------------------------------------------------------------------
+#  Two angles:
+#    1. Any device whose status is NOT 'OK' - likely missing/broken drivers.
+#    2. The 10 most recently installed drivers - useful when a recent update
+#       broke something (correlate the failure with the install date).
+Write-Section "DRIVERS"
+
+$problem = Get-PnpDevice -PresentOnly | Where-Object { $_.Status -ne 'OK' }
+if ($problem) {
+    Write-Sub "Devices with issues"
+    $problem | Select-Object Status, Class, FriendlyName, InstanceId | Format-Table -AutoSize
+} else {
+    Write-Host "All devices report OK."
+}
+
+Write-Sub "10 most recently installed drivers"
+# Win32_PnPSignedDriver has DriverDate - we sort by it descending and take 10.
+Get-CimInstance Win32_PnPSignedDriver |
+    Where-Object DriverDate |
+    Sort-Object DriverDate -Descending |
+    Select-Object -First 10 DeviceName, DriverVersion,
+        @{n='DriverDate';e={$_.DriverDate}} | Format-Table -AutoSize
+
+
+# ---------------------------------------------------------------------------
+#  INSTALLED SOFTWARE  -  last 15 installs
+# ---------------------------------------------------------------------------
+#  Windows tracks installed programs in two registry locations:
+#    HKLM\...\Uninstall              -> 64-bit programs
+#    HKLM\...\Wow6432Node\Uninstall  -> 32-bit programs (on 64-bit Windows)
+#  We read both. Each subkey is one installed app.
+#  Filter: skip entries with no DisplayName or no InstallDate (Windows
+#  Updates and minor components often have neither).
+Write-Section "RECENTLY INSTALLED SOFTWARE (last 15)"
+$keys = @(
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
+Get-ItemProperty $keys |
+    Where-Object { $_.DisplayName -and $_.InstallDate } |
+    Sort-Object InstallDate -Descending |
+    Select-Object -First 15 InstallDate, DisplayName, DisplayVersion, Publisher |
+    Format-Table -AutoSize
+
+
+# ---------------------------------------------------------------------------
+#  BATTERY  -  only shows on laptops
+# ---------------------------------------------------------------------------
+#  Win32_Battery returns nothing on desktops, so we check first and only
+#  print the section if a battery exists.
+$batt = Get-CimInstance Win32_Battery
+if ($batt) {
+    Write-Section "BATTERY"
+    $batt | Select-Object Name, EstimatedChargeRemaining, BatteryStatus, DesignVoltage | Format-List
+}
+
+
+# ---------------------------------------------------------------------------
+#  TOP PROCESSES  -  who's eating RAM right now?
+# ---------------------------------------------------------------------------
+#  WS = Working Set, the amount of RAM the process currently has resident.
+#  Sort descending, take 10, convert bytes -> MB.
+Write-Section "TOP 10 PROCESSES BY MEMORY"
+Get-Process | Sort-Object WS -Descending | Select-Object -First 10 `
+    @{n='MemMB';e={[math]::Round($_.WS/1MB,1)}}, Id, ProcessName, CPU |
+    Format-Table -AutoSize
+
+
+# ---------------------------------------------------------------------------
+#  FOOTER
+# ---------------------------------------------------------------------------
+Write-Host ""
+Write-Host ("=" * 70) -ForegroundColor Green
+Write-Host "  Scan complete.  $($cs.Name)  -  $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor Green
+Write-Host ("=" * 70) -ForegroundColor Green
+
+
+# ---------------------------------------------------------------------------
+#  STOP CAPTURING & SHIP THE REPORT TO THE SHARE
+# ---------------------------------------------------------------------------
+#  Stop-Transcript closes the local report file.
+#  Then we attempt to copy it to the server. The try/catch ensures that even
+#  if the share is offline or permissions are wrong, the script still ends
+#  cleanly and you still have the local copy.
+Stop-Transcript | Out-Null
+
+Write-Host ""
+Write-Host "Local report : $localFile" -ForegroundColor White
+
+# --- Attempt 1: copy as whoever is signed in -------------------------------
+# Works when that is an AD (domain) user. It CANNOT work when the PC is being
+# set up under a LOCAL admin account - the file server only grants access to
+# AD users, so a local account is refused ("user name or password is
+# incorrect") even though the path is perfectly reachable.
+# No ShareBase (a PC off the managed LAN, or the public build) means there is no
+# server to file the report on - the local copy stands alone. $shareDir is empty
+# then, so the whole share section is skipped.
+$shareOk = $false
+if ($shareDir) {
+    try {
+        # Create the reports/ subfolder on the share if it doesn't exist yet.
+        if (-not (Test-Path $shareDir)) {
+            New-Item -ItemType Directory -Path $shareDir -Force -ErrorAction Stop | Out-Null
+        }
+        # Copy the local report up to the share with the same filename.
+        Copy-Item -Path $localFile -Destination (Join-Path $shareDir $reportName) -Force -ErrorAction Stop
+        $shareOk = $true
+    }
+    catch {
+        # Capture the reason so we can show it to the user.
+        $shareErr = $_.Exception.Message
+    }
+}
+
+# --- Attempt 2: borrow an AD account just for the copy ---------------------
+# Only reached when attempt 1 failed. The usual cause is the local-admin case
+# above, so rather than shrug, offer to authenticate to the file server with a
+# domain account. The technician doing the setup has one to hand.
+#
+# New-PSDrive opens an authenticated session to the SERVER; once that exists,
+# the ordinary UNC path works for the rest of this script. The session is torn
+# down again immediately after - nothing is saved or remembered on the PC.
+#
+# Whoever is running this is standing at the machine, so a prompt is fine. If
+# they decline, the pen copy below is still taken.
+if (-not $shareOk -and $shareDir) {
+    Write-Host ""
+    Write-Host "Server copy  : FAILED  ($shareErr)" -ForegroundColor Yellow
+
+    $iAmDomainUser = (Get-CimInstance Win32_ComputerSystem).PartOfDomain -and
+                     ($env:USERDOMAIN -ne $env:COMPUTERNAME)
+
+    if (-not $iAmDomainUser) {
+        Write-Host "             : You are signed in as a LOCAL account ($env:USERDOMAIN\$env:USERNAME)." -ForegroundColor Yellow
+        Write-Host "             : The file server only accepts AD (domain) users." -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    $retry = Read-Host "  Send it to the server using a domain account? (y/n)"
+
+    if ($retry -eq 'y') {
+        $cred = Get-Credential -Message "Domain account with access to the file server (e.g. $($Site.AdminHint))"
+        if ($cred) {
+            try {
+                New-PSDrive -Name 'KDReports' -PSProvider FileSystem `
+                            -Root $shareRoot -Credential $cred -ErrorAction Stop | Out-Null
+                try {
+                    if (-not (Test-Path $shareDir)) {
+                        New-Item -ItemType Directory -Path $shareDir -Force -ErrorAction Stop | Out-Null
+                    }
+                    Copy-Item -Path $localFile -Destination (Join-Path $shareDir $reportName) `
+                              -Force -ErrorAction Stop
+                    $shareOk = $true
+                }
+                finally {
+                    # Always drop the session, even if the copy threw.
+                    Remove-PSDrive -Name 'KDReports' -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                Write-Host "  Still failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+    }
+}
+
+if ($shareOk) {
+    Write-Host "Server copy  : $shareDir\$reportName" -ForegroundColor Green
+} else {
+    Write-Host "Server copy  : not sent." -ForegroundColor Yellow
+}
+
+# --- Third copy: the setup pen, if it is plugged in ------------------------
+# This is the one that matters on a PC with no network yet - it is how the
+# report gets off the machine and back to you.
+if ($penDir) {
+    try {
+        if (-not (Test-Path $penDir)) {
+            New-Item -ItemType Directory -Path $penDir -Force -ErrorAction Stop | Out-Null
+        }
+        Copy-Item -Path $localFile -Destination (Join-Path $penDir $reportName) -Force -ErrorAction Stop
+        Write-Host "Pen copy     : $penDir\$reportName" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Pen copy     : FAILED  ($($_.Exception.Message))" -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host "Pen copy     : skipped (setup pen not plugged in)" -ForegroundColor DarkGray
+}
+
+# Close the loop. Three cases worth spelling out, because the difference
+# between them decides what the technician has to do next.
+Write-Host ""
+if (-not $shareOk -and $penDir) {
+    # The normal new-PC case: local admin, no AD rights, but the pen has it.
+    Write-Host "The report is on the pen but NOT yet on the server." -ForegroundColor Cyan
+    Write-Host "Push it up later from any PC signed in as an AD user:" -ForegroundColor Cyan
+    Write-Host "    .\scripts\sync-pen-reports.ps1" -ForegroundColor White
+    Write-Host "  (or, from the pen itself:  <pen>\network-tools\sync-pen-reports.ps1)" -ForegroundColor DarkGray
+}
+elseif (-not $shareOk -and -not $penDir) {
+    # Worst case - nothing left the machine.
+    Write-Host "WARNING: this report exists ONLY on this PC's desktop." -ForegroundColor Red
+    Write-Host "         Plug the setup pen in and re-run, or copy it off by hand." -ForegroundColor Red
+}
