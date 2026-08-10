@@ -16,7 +16,7 @@
 #    - the physical (USB / TCP-IP) ports
 #
 #  Nothing is changed on either PC. It is the "what's going on over there"
-#  companion to add-printer.
+#  companion to printer.
 #
 #  HOW TO RUN
 #  ----------
@@ -114,10 +114,16 @@ function Resolve-Pc($query) {
 
 
 Write-Head 'PRINTER INFO'
-$query = (Read-Host '  PC name, IP, or staff name').Trim()
-if (-not $query) { return }
+# Default to THIS PC - the common case is "what's on the machine I'm at". Only
+# reach out to another PC if the tech names one.
+Write-Host '  Press Enter for THIS PC, or type another PC name / IP / staff name.' -ForegroundColor DarkGray
+$query = (Read-Host "  PC (Enter = $env:COMPUTERNAME)").Trim()
 
-$pc = Resolve-Pc $query
+if (-not $query) {
+    $pc = $env:COMPUTERNAME
+} else {
+    $pc = Resolve-Pc $query
+}
 
 # ---------------------------------------------------------------------------
 #  REPORT LOG

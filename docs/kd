@@ -36,23 +36,26 @@ $Site = @{
 # <#/SITE#>
 
 # ShareBase present -> internal (read .txt off the share). Empty -> public
-# (fetch each tool from the hub over https, and show only Public tools).
+# (fetch each tool from the hub over https).
 $public = -not $Site.ShareBase
 
 # --- Tool catalogue --------------------------------------------------------
-#  Name = tool + menu label, Public = shown/allowed in the public menu,
-#  Desc = one-line description. Fetch target is derived from the mode.
+#  Name = tool + menu label, Desc = one-line description, Show = where it is
+#  listed: 'both', 'internal', or 'public'. The individual printer-* tools are
+#  'public' - internally the 'printer' hub covers them, so they are not repeated
+#  in the office menu. Fetch target is derived from the mode.
 $tools = @(
-    [pscustomobject]@{ Name = 'newpc';           Public = $false; Desc = 'Set up a new PC (admin)' }
-    [pscustomobject]@{ Name = 'add-printer';     Public = $false; Desc = 'Connect / share a printer (admin)' }
-    [pscustomobject]@{ Name = 'printer-info';    Public = $true;  Desc = "Show a PC's printers, remotely" }
-    [pscustomobject]@{ Name = 'print-diag';      Public = $true;  Desc = 'Diagnose print sharing failures' }
-    [pscustomobject]@{ Name = 'clearprinterspool'; Public = $true; Desc = 'Clear stuck print jobs' }
-    [pscustomobject]@{ Name = 'sysinfo';         Public = $true;  Desc = 'PC inventory snapshot' }
-    [pscustomobject]@{ Name = 'gateway-monitor'; Public = $true;  Desc = 'Connectivity diagnostic' }
+    [pscustomobject]@{ Name = 'newpc';           Show = 'internal'; Desc = 'Set up a new PC (admin)' }
+    [pscustomobject]@{ Name = 'printer';         Show = 'internal'; Desc = 'Connect / share / remove printers + diagnostics' }
+    [pscustomobject]@{ Name = 'printer-info';    Show = 'public';   Desc = "Show a PC's printers, remotely" }
+    [pscustomobject]@{ Name = 'printer-diag';    Show = 'public';   Desc = 'Diagnose print sharing failures' }
+    [pscustomobject]@{ Name = 'printer-clear';   Show = 'public';   Desc = 'Clear stuck print jobs' }
+    [pscustomobject]@{ Name = 'sysinfo';         Show = 'both';     Desc = 'PC inventory snapshot' }
+    [pscustomobject]@{ Name = 'gateway-monitor'; Show = 'both';     Desc = 'Connectivity diagnostic' }
 )
-# The menu: everything internally, only the Public ones on the hub.
-$menu = if ($public) { @($tools | Where-Object Public) } else { $tools }
+# The menu for this context: 'both' plus the current tier's own entries.
+$tier = if ($public) { 'public' } else { 'internal' }
+$menu = @($tools | Where-Object { $_.Show -eq 'both' -or $_.Show -eq $tier })
 
 
 function Show-Menu {

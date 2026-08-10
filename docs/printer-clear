@@ -1,5 +1,5 @@
 # =============================================================================
-#  clearprinterspool.ps1  -  Clear stuck print jobs
+#  printer-clear.ps1  -  Clear stuck print jobs
 # =============================================================================
 #
 #  AUTHOR
@@ -24,8 +24,8 @@
 #
 #  HOW TO RUN
 #  ----------
-#     irm <host>/clearprinterspool | iex          (public)
-#  or from the pen / share menu, pick "clearprinterspool".
+#     irm <host>/printer-clear | iex          (public)
+#  or from the pen / share menu, pick "printer-clear".
 #
 #  It is INTERACTIVE - it asks, it does not take parameters (they cannot be
 #  passed through iex).

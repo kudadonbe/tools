@@ -1,5 +1,5 @@
 # =============================================================================
-#  print-diag.ps1  -  Why is printing to / from THIS PC failing?
+#  printer-diag.ps1  -  Why is printing to / from THIS PC failing?
 # =============================================================================
 #
 #  AUTHOR
@@ -21,8 +21,8 @@
 #
 #  HOW TO RUN
 #  ----------
-#  From the pen or share menu, pick "print-diag". Or directly:
-#     irm <host>/print-diag | iex
+#  From the pen or share menu, pick "printer-diag". Or directly:
+#     irm <host>/printer-diag | iex
 #
 #  Run it AS ADMINISTRATOR to also see the Security log (who is being refused).
 #  Run it on the HOST (the PC that shares the printer) first - that is where a
@@ -44,16 +44,16 @@ function Flag($t) { Write-Host "  !! $t" -ForegroundColor Yellow }
 #  REPORT LOG
 # ---------------------------------------------------------------------------
 #  Keep every run - a diagnostic you took the trouble to run on a remote PC is
-#  worth a record. Preferred home is the share (reports\print-diag\), so the
+#  worth a record. Preferred home is the share (reports\printer-diag\), so the
 #  result is filed centrally with the sysinfo reports; if the share is not
 #  reachable it falls back to TEMP so the run is never lost. Transcript, so the
 #  file is a plain mirror of exactly what is on screen.
-$reportName = "print-diag_{0}_{1}.txt" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss')
+$reportName = "printer-diag_{0}_{1}.txt" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss')
 # Prefer the office share; fall back to TEMP. With no ShareBase (a public build,
 # or a PC off the managed LAN) it just uses TEMP - the run is never lost.
-$reportDir = if ($Site.ShareBase) { Join-Path $Site.ShareBase 'reports\print-diag' } else { Join-Path $env:TEMP 'print-diag' }
+$reportDir = if ($Site.ShareBase) { Join-Path $Site.ShareBase 'reports\printer-diag' } else { Join-Path $env:TEMP 'printer-diag' }
 try { New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction Stop | Out-Null }
-catch { $reportDir = Join-Path $env:TEMP 'print-diag' ; New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction SilentlyContinue | Out-Null }
+catch { $reportDir = Join-Path $env:TEMP 'printer-diag' ; New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction SilentlyContinue | Out-Null }
 $reportFile = Join-Path $reportDir $reportName
 try { Start-Transcript -Path $reportFile -Force -ErrorAction Stop | Out-Null } catch { $reportFile = $null }
 
@@ -153,7 +153,7 @@ if ($logonFails) {
         $known += "AUTH FAILURE (0xc0000064) from $src - a LOCAL account was presented to this " +
                   "domain host and rejected as 'no such user'. That PC is WORKGROUP and printing " +
                   "leaked its local identity. Fix: store a domain credential for BOTH the IP and " +
-                  "the hostname on that PC (add-printer does this, and it must PERSIST), or join it " +
+                  "the hostname on that PC (printer does this, and it must PERSIST), or join it " +
                   "to the domain. This is NOT a Windows-update problem."
     }
     $badPw = $logonFails | Where-Object { $_.Sub -eq '0xc000006a' }
@@ -161,12 +161,12 @@ if ($logonFails) {
 }
 if ($msgs -match '0x0000011b')            { $known += '0x0000011b LOGGED -> RPC packet-privacy mismatch (KB5005565 class). Fix: patch BOTH sides to current builds; RpcAuthnLevelPrivacyEnabled=0 on the host is a DIAGNOSIS-ONLY test that re-opens the CVE.' }
 if ($msgs -match '0x00000709')            { $known += '0x00000709 LOGGED -> name / default-printer conflict, or GP adding a queue that has moved (check the target with printer-info).' }
-if ($msgs -match '0x0000007c|0x00000bcb') { $known += 'driver-fetch error LOGGED -> Point-and-Print restriction; stage the driver locally instead (add-printer does this).' }
+if ($msgs -match '0x0000007c|0x00000bcb') { $known += 'driver-fetch error LOGGED -> Point-and-Print restriction; stage the driver locally instead (printer does this).' }
 
 # --- configuration observations: only a hint, never a verdict on their own -
 if (-not $known) {
     if ($null -eq $rpcPriv -and $shared) { $known += 'Observation only (no print errors logged): this host enforces RPC packet privacy, the DEFAULT. It bites only an old/unpatched CLIENT - look for 0x0000011b in THAT client log before concluding.' }
-    if ($cs.PartOfDomain -eq $false)     { $known += 'Observation only: this is a workgroup PC, so its jobs to domain hosts ride on the per-user cmdkey credential add-printer stores. If printing fails, run this on the HOST as admin and read the failed-logon section.' }
+    if ($cs.PartOfDomain -eq $false)     { $known += 'Observation only: this is a workgroup PC, so its jobs to domain hosts ride on the per-user cmdkey credential printer stores. If printing fails, run this on the HOST as admin and read the failed-logon section.' }
     if (-not $known) { $known = @('nothing conclusive - no print errors and no failed logons in the window. Enable the Operational channel, reproduce the failing print, re-run.') }
 }
 $known | ForEach-Object { Flag $_ }
