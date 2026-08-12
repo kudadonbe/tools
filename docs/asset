@@ -1,0 +1,293 @@
+# =============================================================================
+#  asset.ps1  -  record the fixed-asset numbers of everything at this desk
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#
+#  WHAT IT DOES
+#  ------------
+#  Procurement issues an asset register number for EACH item - the PC, the
+#  monitor, the keyboard, the mouse, the printer, the UPS... This tool records
+#  them all ON the PC they sit with, so the desk carries its own inventory:
+#
+#      HKLM:\SOFTWARE\<org>\Assets     one value per item  (Item = AssetNo)
+#      HKLM:\SOFTWARE\<org>\AssetNo    the PC's own number (kept in step -
+#                                      sysinfo and the portal read it, and it
+#                                      is mirrored to the computer description
+#                                      so plain Windows UI shows it)
+#
+#  sysinfo reports the whole set in every snapshot, so the fleet portal can
+#  reconcile each desk against the finance register.
+#
+#  HOW TO RUN
+#  ----------
+#  From the pen or share menu (kd), pick "asset". Needs Administrator (it
+#  writes HKLM).
+#
+#  SAFETY
+#  ------
+#  Writes only the registry values above (and the computer description when
+#  the PC's own number changes). Nothing else is touched.
+# =============================================================================
+
+$ErrorActionPreference = 'Stop'
+
+# <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
+$Site = @{
+    Site        = ''
+    AssetOffice = ''
+}
+# <#/SITE#>
+
+# <#FUNCTIONS#>  generated from config/functions.ps1 by distribute.ps1 -Sync - do not edit by hand
+function Get-OrgRegKey {
+    # The registry home for ORG metadata stored on a PC (asset number, and
+    # whatever comes later). Named after the org, not the toolmaker:
+    # HKLM:\SOFTWARE\FC on site, HKLM:\SOFTWARE\Org in the generic build.
+    $org = if ($Site -and $Site.Site) { $Site.Site } else { 'Org' }
+    return "HKLM:\SOFTWARE\$org"
+}
+
+function Test-AssetNo([string]$no) {
+    # Maldives MoF fixed-asset register number, as procurement issues them:
+    #   {office}-{year}-{catNo}-{typeNo}-{serial}
+    # Office code: 2-4 alphanumeric, assigned per office by the MoF register -
+    # this site's is $Site.AssetOffice. Year YYYY; category 01-09 or 290 (IT
+    # hardware is 03 Equipment); type 3 digits; serial 4 digits. Same rule as
+    # the kd-server asset module (docs/ASSET_MANAGEMENT_SPEC.md, built on the
+    # MoF Asset Master Data Form / fixed-asset policy, IPSAS 17).
+    return $no -match '^[A-Z0-9]{2,4}-\d{4}-(0[1-9]|290)-\d{3}-\d{4}$'
+}
+
+function Get-PrimaryUser {
+    # THE RULE: the most RECENTLY ACTIVE user owns the PC.
+    #
+    # Not "whoever is logged in" - that hands the PC to a relief staff member
+    # (or the IT person standing at the keyboard) who happened to be at the
+    # desk during the scan.
+    #
+    # Not "whoever has the most files" either. That was the old rule, and it
+    # gets a reassigned PC permanently wrong: a leaver with 3,000 stale
+    # documents outranks the new owner with 40 fresh ones, forever.
+    #
+    # So we rank by the LAST TIME the person actually did work - the newest
+    # write in their Documents / Desktop / Downloads. File count survives only
+    # as a tiebreak, and to prove a profile is real rather than a single logon.
+    #
+    # THE TRAP: NTUSER.DAT is rewritten on every logon, so the IT person
+    # running this scan ALWAYS has the freshest one. Ranking on it would hand
+    # every PC in the office to whoever did the scanning. It is therefore used
+    # ONLY as a fallback, never as the recency signal - see below.
+    #
+    # IT/admin accounts come from $Site.ItUsers (site.psd1); returns a profile
+    # name like 'reemaa.abdulrahmaan', or 'unknown'.
+
+    $itUsers = @()
+    if ($Site -and $Site.ItUsers) { $itUsers = @($Site.ItUsers | ForEach-Object { $_.ToLower() }) }
+
+    # Built-in Windows profile folders to always skip when scanning C:\Users.
+    $systemProfiles = @('Default','Default User','Public','All Users','defaultuser0',
+                        'WDAGUtilityAccount')
+
+    $svc = @('SYSTEM','LOCALSYSTEM','LOCAL SERVICE','NETWORK SERVICE','DWM-1','UMFD-0','UMFD-1')
+    $me  = $env:USERNAME
+
+    $candidates = Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            $name = $_.Name
+            ($systemProfiles -notcontains $name) -and
+            ($name -notmatch '^\.|\$$') -and
+            ($svc -notcontains $name.ToUpper())
+        }
+
+    $scored = foreach ($p in $candidates) {
+        $folders = @(
+            (Join-Path $p.FullName 'Documents'),
+            (Join-Path $p.FullName 'Desktop'),
+            (Join-Path $p.FullName 'Downloads'),
+            (Join-Path $p.FullName 'OneDrive\Documents'),
+            (Join-Path $p.FullName 'OneDrive\Desktop')
+        )
+
+        $fileCount = 0
+        $docLatest = $null      # real work: newest write in the doc folders
+        foreach ($f in $folders) {
+            # NTFS denies other users' Documents unless we are admin. Skip
+            # quietly - that case is handled by the fallback further down.
+            if (-not (Test-Path $f -ErrorAction SilentlyContinue)) { continue }
+            $items = Get-ChildItem $f -File -Depth 1 -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 500
+            $fileCount += @($items).Count
+            $maxDate = ($items | Measure-Object LastWriteTime -Maximum -ErrorAction SilentlyContinue).Maximum
+            if ($maxDate -and (-not $docLatest -or $maxDate -gt $docLatest)) { $docLatest = $maxDate }
+        }
+
+        # Logon time. Kept SEPARATE from $docLatest, and deliberately never
+        # mixed into it - see THE TRAP above.
+        $loginLatest = $null
+        $ntu = Join-Path $p.FullName 'NTUSER.DAT'
+        if (Test-Path $ntu -ErrorAction SilentlyContinue) {
+            $loginLatest = (Get-Item $ntu -Force -ErrorAction SilentlyContinue).LastWriteTime
+        }
+
+        [pscustomobject]@{
+            Name        = $p.Name
+            Files       = $fileCount
+            DocLatest   = $docLatest
+            LoginLatest = $loginLatest
+            IsIT        = ($itUsers -contains $p.Name.ToLower())
+        }
+    }
+
+    if (-not $scored) { return 'unknown' }
+
+    # --- Rank by real work: most recent document activity first -------------
+    $active    = @($scored | Where-Object { $_.Files -gt 0 -and $_.DocLatest })
+    $ranked    = @($active | Sort-Object DocLatest, Files -Descending)
+    $bestNonIt = @($ranked | Where-Object { -not $_.IsIT }) | Select-Object -First 1
+    $bestIt    = @($ranked | Where-Object { $_.IsIT })      | Select-Object -First 1
+
+    if ($bestNonIt) {
+        # An IT profile only takes the PC off a real user if it is plainly IT's
+        # OWN workstation: more recent work AND at least twice the files.
+        if ($bestIt -and
+            $bestIt.DocLatest -gt $bestNonIt.DocLatest -and
+            $bestIt.Files -ge (2 * [Math]::Max($bestNonIt.Files, 1))) {
+            return $bestIt.Name
+        }
+        return $bestNonIt.Name
+    }
+
+    if ($bestIt) { return $bestIt.Name }   # only IT has ever worked here
+
+    # --- Fallback: no document activity was readable ------------------------
+    # We are running as a normal user, so NTFS hid everyone else's Documents.
+    # The only signals left are who is logged in, and logon times.
+    if ($me -and ($itUsers -notcontains $me.ToLower()) -and ($me -notmatch '\$$')) {
+        return $me
+    }
+
+    # Logged in as IT. Fall back to the non-IT profile with the newest logon.
+    # Not as good as document activity, but it beats naming the PC after IT.
+    $byLogin = @($scored | Where-Object { -not $_.IsIT -and $_.LoginLatest } |
+                 Sort-Object LoginLatest -Descending) | Select-Object -First 1
+    if ($byLogin) { return $byLogin.Name }
+
+    if ($me) { return $me }
+    return 'unknown'
+}
+# <#/FUNCTIONS#>
+
+function Write-Head($text) {
+    Write-Host ''
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+}
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+
+Write-Head "ASSET NUMBERS  -  $env:COMPUTERNAME"
+
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Bad 'This must be run as Administrator (it writes HKLM).'
+    return
+}
+
+$orgKey   = Get-OrgRegKey
+$assetKey = Join-Path $orgKey 'Assets'
+
+# The item names offered as shortcuts. Free text is always allowed - these
+# just keep the spelling identical across desks so the portal can group them.
+$commonItems = @('PC', 'Monitor', 'Monitor2', 'Monitor3', 'Keyboard', 'Mouse',
+                 'Printer', 'Scanner', 'UPS')
+
+function Get-AssetRecords {
+    # All recorded items, with the legacy single AssetNo folded in as 'PC'
+    # when the Assets key does not have its own PC entry yet.
+    $rec = [ordered]@{}
+    $p = Get-ItemProperty $assetKey -ErrorAction SilentlyContinue
+    if ($p) {
+        foreach ($n in ($p.PSObject.Properties.Name | Where-Object { $_ -notmatch '^PS' } | Sort-Object)) {
+            $rec[$n] = $p.$n
+        }
+    }
+    if (-not $rec.Contains('PC')) {
+        $legacy = (Get-ItemProperty $orgKey -ErrorAction SilentlyContinue).AssetNo
+        if ($legacy) { $rec['PC'] = $legacy }
+    }
+    return $rec
+}
+
+function Show-AssetRecords {
+    $rec = Get-AssetRecords
+    Write-Host ''
+    if (-not $rec.Count) { Write-Host '  (no asset numbers recorded on this PC yet)' -ForegroundColor DarkGray; return }
+    Write-Host '  Recorded on this PC:' -ForegroundColor White
+    foreach ($k in $rec.Keys) { Write-Host ("    {0,-12} {1}" -f $k, $rec[$k]) }
+}
+
+while ($true) {
+    Show-AssetRecords
+    Write-Host ''
+    Write-Host '   A.  Add / update an item'
+    Write-Host '   R.  Remove an item'
+    Write-Host '   0.  exit'
+    $choice = (Read-Host '  Choose').Trim()
+
+    switch -Regex ($choice) {
+        '^[Aa]$' {
+            Write-Host ("  Items: {0}  (or type any name)" -f ($commonItems -join ', ')) -ForegroundColor Gray
+            $item = (Read-Host '  Item').Trim()
+            if (-not $item) { Write-Warn 'No item given.'; continue }
+            # Normalize to the common spelling when it matches one, so 'mouse'
+            # and 'Mouse' do not become two different rows in the portal.
+            $match = $commonItems | Where-Object { $_ -ieq $item } | Select-Object -First 1
+            if ($match) { $item = $match }
+            $item = $item -replace '[^\w-]', ''
+
+            $ofc = if ($Site.AssetOffice) { $Site.AssetOffice } else { 'OFC' }
+            Write-Host '  Format (from procurement): {office}-{year}-{cat}-{type}-{serial}' -ForegroundColor Gray
+            Write-Host "  e.g. $ofc-2024-03-073-0001   ($ofc = this office's register code; 03 = Equipment)" -ForegroundColor Gray
+            $no = (Read-Host "  Asset number for $item").Trim().ToUpper()
+            if (-not $no) { Write-Warn 'No number given.'; continue }
+            if (-not (Test-AssetNo $no)) {
+                Write-Warn "'$no' does not match the register format - likely a typo."
+                if ((Read-Host '  Save it anyway? (y/n)') -notmatch '^[Yy]') { Write-Warn 'Not saved.'; continue }
+            }
+
+            if (-not (Test-Path $assetKey)) { New-Item -Path $assetKey -Force | Out-Null }
+            Set-ItemProperty -Path $assetKey -Name $item -Value $no
+            Write-Ok "$item = $no"
+
+            # The PC's own number also feeds the legacy value + the computer
+            # description, exactly as rename-pc does - one behavior, not two.
+            if ($item -eq 'PC') {
+                Set-ItemProperty -Path $orgKey -Name 'AssetNo' -Value $no
+                try {
+                    Get-CimInstance Win32_OperatingSystem |
+                        Set-CimInstance -Property @{ Description = "Asset $no" }
+                    Write-Ok 'also set as the computer description (visible in sysdm.cpl / Network view)'
+                } catch { Write-Warn "could not set the computer description: $($_.Exception.Message)" }
+            }
+        }
+        '^[Rr]$' {
+            $rec = Get-AssetRecords
+            if (-not $rec.Count) { Write-Warn 'Nothing recorded to remove.'; continue }
+            $item = (Read-Host '  Remove which item').Trim()
+            $match = @($rec.Keys) | Where-Object { $_ -ieq $item } | Select-Object -First 1
+            if (-not $match) { Write-Warn "No item named '$item' recorded."; continue }
+            Remove-ItemProperty -Path $assetKey -Name $match -ErrorAction SilentlyContinue
+            if ($match -eq 'PC') { Remove-ItemProperty -Path $orgKey -Name 'AssetNo' -ErrorAction SilentlyContinue }
+            Write-Ok "removed $match"
+        }
+        '^0?$' { Write-Host '  Done.' -ForegroundColor Green; return }
+        default { Write-Warn "Invalid choice: '$choice'" }
+    }
+}

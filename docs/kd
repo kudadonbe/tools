@@ -47,6 +47,7 @@ $public = -not $Site.ShareBase
 $tools = @(
     [pscustomobject]@{ Name = 'newpc';           Show = 'internal'; Desc = 'Set up a new PC (admin)' }
     [pscustomobject]@{ Name = 'rename-pc';       Show = 'internal'; Desc = 'PC name protocol + asset number (admin)' }
+    [pscustomobject]@{ Name = 'asset';           Show = 'both';     Desc = 'Record asset numbers for this desk (PC, monitor, ...) (admin)' }
     [pscustomobject]@{ Name = 'printer';         Show = 'internal'; Desc = 'Connect / share / remove printers + diagnostics' }
     [pscustomobject]@{ Name = 'printer-info';    Show = 'public';   Desc = "Show a PC's printers, remotely" }
     [pscustomobject]@{ Name = 'printer-diag';    Show = 'public';   Desc = 'Diagnose print sharing failures' }

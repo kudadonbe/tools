@@ -142,12 +142,12 @@ function Get-OrgRegKey {
 
 function Test-AssetNo([string]$no) {
     # Maldives MoF fixed-asset register number, as procurement issues them:
-    #   {office}-{year}-{catNo}-{typeNo}-{serial}   e.g. 146-2024-03-073-0001
-    # (office code 2-4 alphanumeric - FC's MoF office code is 146; year YYYY;
-    # category 01-09 or 290, IT hardware is 03 Equipment; type 3 digits;
-    # serial 4 digits.) Same rule as the kd-server asset module - see its
-    # docs/ASSET_MANAGEMENT_SPEC.md, built on the MoF Asset Master Data Form
-    # / fixed-asset policy (IPSAS 17).
+    #   {office}-{year}-{catNo}-{typeNo}-{serial}
+    # Office code: 2-4 alphanumeric, assigned per office by the MoF register -
+    # this site's is $Site.AssetOffice. Year YYYY; category 01-09 or 290 (IT
+    # hardware is 03 Equipment); type 3 digits; serial 4 digits. Same rule as
+    # the kd-server asset module (docs/ASSET_MANAGEMENT_SPEC.md, built on the
+    # MoF Asset Master Data Form / fixed-asset policy, IPSAS 17).
     return $no -match '^[A-Z0-9]{2,4}-\d{4}-(0[1-9]|290)-\d{3}-\d{4}$'
 }
 
@@ -514,6 +514,18 @@ Write-Section "SYSTEM SNAPSHOT  -  $($cs.Name)  -  $(Get-Date -Format 'yyyy-MM-d
     # New-TimeSpan = (LastBoot - Now). ToString('d\.hh\:mm') = "days.hh:mm"
     Uptime       = (New-TimeSpan -Start $os.LastBootUpTime -End (Get-Date)).ToString('d\.hh\:mm')
 } | Format-List
+
+# The rest of the desk's register numbers (monitor, keyboard, printer...),
+# as recorded by the 'asset' tool under <org>\Assets - one line per item.
+$assetProps = Get-ItemProperty (Join-Path (Get-OrgRegKey) 'Assets') -ErrorAction SilentlyContinue
+if ($assetProps) {
+    $rows = @($assetProps.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | Sort-Object Name)
+    if ($rows) {
+        Write-Sub "Registered assets"
+        $rows | ForEach-Object { [pscustomobject]@{ Item = $_.Name; AssetNo = $_.Value } } |
+            Format-Table -AutoSize
+    }
+}
 
 
 # ---------------------------------------------------------------------------
