@@ -155,6 +155,47 @@ function Test-AssetNo([string]$no) {
     return $no -match '^[A-Z0-9]{2,4}-\d{4}-(0[1-9]|290)-\d{3}-\d{4}[A-Z]?$'
 }
 
+function Get-AssetBackupFile {
+    # Where this PC's asset-number backup lives on the office share - keyed by
+    # the BIOS SERIAL, the one identifier a format cannot erase. So the tag
+    # survives a reimage: the asset tool finds the file by serial afterwards
+    # and offers the numbers back. $null when off the office LAN (no
+    # ShareBase) or when the firmware has no usable serial.
+    if (-not ($Site -and $Site.ShareBase)) { return $null }
+    $serial = (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
+    if (-not $serial -or $serial -match '^(To be filled|Default|None|System Serial|0+$|\s*$)') { return $null }
+    $safe = ($serial.Trim() -replace '[^\w\.-]', '_')
+    return Join-Path $Site.ShareBase ("reports\assets\{0}.txt" -f $safe)
+}
+
+function Save-AssetBackup {
+    # Copy everything recorded under <org>\Assets (plus the legacy AssetNo)
+    # to the share file above. Best-effort: any failure is silent - the
+    # registry stays the working copy, the share copy is the format-survivor.
+    $file = Get-AssetBackupFile
+    if (-not $file) { return }
+    $orgKey = Get-OrgRegKey
+    $rec = [ordered]@{}
+    $p = Get-ItemProperty (Join-Path $orgKey 'Assets') -ErrorAction SilentlyContinue
+    if ($p) {
+        foreach ($n in ($p.PSObject.Properties.Name | Where-Object { $_ -notmatch '^PS' } | Sort-Object)) {
+            $rec[$n] = $p.$n
+        }
+    }
+    if (-not $rec.Count) {
+        $legacy = (Get-ItemProperty $orgKey -ErrorAction SilentlyContinue).AssetNo
+        if ($legacy) { $rec['PC'] = $legacy }
+    }
+    if (-not $rec.Count) { return }
+    try {
+        $dir = Split-Path $file
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $lines = @("# $env:COMPUTERNAME  $(Get-Date -Format 'yyyy-MM-dd HH:mm')  asset numbers (keyed by BIOS serial)")
+        foreach ($k in $rec.Keys) { $lines += "$k=$($rec[$k])" }
+        Set-Content -Path $file -Value $lines -Encoding UTF8
+    } catch { }
+}
+
 function Get-PrimaryUser {
     # THE RULE: the most RECENTLY ACTIVE user owns the PC.
     #

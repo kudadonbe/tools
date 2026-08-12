@@ -38,6 +38,7 @@ $ErrorActionPreference = 'Stop'
 $Site = @{
     Site        = ''
     AssetOffice = ''
+    ShareBase   = ''
 }
 # <#/SITE#>
 
@@ -63,6 +64,47 @@ function Test-AssetNo([string]$no) {
     # / fixed-asset policy, IPSAS 17), plus the suffix seen in this org's
     # register.
     return $no -match '^[A-Z0-9]{2,4}-\d{4}-(0[1-9]|290)-\d{3}-\d{4}[A-Z]?$'
+}
+
+function Get-AssetBackupFile {
+    # Where this PC's asset-number backup lives on the office share - keyed by
+    # the BIOS SERIAL, the one identifier a format cannot erase. So the tag
+    # survives a reimage: the asset tool finds the file by serial afterwards
+    # and offers the numbers back. $null when off the office LAN (no
+    # ShareBase) or when the firmware has no usable serial.
+    if (-not ($Site -and $Site.ShareBase)) { return $null }
+    $serial = (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
+    if (-not $serial -or $serial -match '^(To be filled|Default|None|System Serial|0+$|\s*$)') { return $null }
+    $safe = ($serial.Trim() -replace '[^\w\.-]', '_')
+    return Join-Path $Site.ShareBase ("reports\assets\{0}.txt" -f $safe)
+}
+
+function Save-AssetBackup {
+    # Copy everything recorded under <org>\Assets (plus the legacy AssetNo)
+    # to the share file above. Best-effort: any failure is silent - the
+    # registry stays the working copy, the share copy is the format-survivor.
+    $file = Get-AssetBackupFile
+    if (-not $file) { return }
+    $orgKey = Get-OrgRegKey
+    $rec = [ordered]@{}
+    $p = Get-ItemProperty (Join-Path $orgKey 'Assets') -ErrorAction SilentlyContinue
+    if ($p) {
+        foreach ($n in ($p.PSObject.Properties.Name | Where-Object { $_ -notmatch '^PS' } | Sort-Object)) {
+            $rec[$n] = $p.$n
+        }
+    }
+    if (-not $rec.Count) {
+        $legacy = (Get-ItemProperty $orgKey -ErrorAction SilentlyContinue).AssetNo
+        if ($legacy) { $rec['PC'] = $legacy }
+    }
+    if (-not $rec.Count) { return }
+    try {
+        $dir = Split-Path $file
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $lines = @("# $env:COMPUTERNAME  $(Get-Date -Format 'yyyy-MM-dd HH:mm')  asset numbers (keyed by BIOS serial)")
+        foreach ($k in $rec.Keys) { $lines += "$k=$($rec[$k])" }
+        Set-Content -Path $file -Value $lines -Encoding UTF8
+    } catch { }
 }
 
 function Get-PrimaryUser {
@@ -237,6 +279,38 @@ function Show-AssetRecords {
     foreach ($k in $rec.Keys) { Write-Host ("    {0,-12} {1}" -f $k, $rec[$k]) }
 }
 
+# ---------------------------------------------------------------------------
+#  RESTORE AFTER A FORMAT
+# ---------------------------------------------------------------------------
+#  A reimage wipes the registry, but the share keeps this machine's numbers
+#  keyed by its BIOS serial (Save-AssetBackup). Empty registry + a backup on
+#  the share = this PC was probably just rebuilt, so offer the numbers back.
+$backupFile = Get-AssetBackupFile
+if ($backupFile -and (Test-Path $backupFile) -and -not (Get-AssetRecords).Count) {
+    Write-Host ''
+    Write-Warn 'No asset numbers on this PC, but the share has a backup for this'
+    Write-Warn 'machine (matched by BIOS serial - it survives formatting):'
+    $restored = [ordered]@{}
+    foreach ($line in (Get-Content $backupFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*#' -or $line -notmatch '=') { continue }
+        $k, $v = $line -split '=', 2
+        if ($k.Trim() -and $v.Trim()) { $restored[$k.Trim()] = $v.Trim() }
+    }
+    foreach ($k in $restored.Keys) { Write-Host ("    {0,-12} {1}" -f $k, $restored[$k]) }
+    if ($restored.Count -and (Read-Host '  Restore these? (y/n)') -match '^[Yy]') {
+        if (-not (Test-Path $assetKey)) { New-Item -Path $assetKey -Force | Out-Null }
+        foreach ($k in $restored.Keys) { Set-ItemProperty -Path $assetKey -Name $k -Value $restored[$k] }
+        if ($restored.Contains('PC')) {
+            Set-ItemProperty -Path $orgKey -Name 'AssetNo' -Value $restored['PC']
+            try {
+                Get-CimInstance Win32_OperatingSystem |
+                    Set-CimInstance -Property @{ Description = "Asset $($restored['PC'])" }
+            } catch { }
+        }
+        Write-Ok "restored $($restored.Count) item(s)"
+    }
+}
+
 while ($true) {
     Show-AssetRecords
     Write-Host ''
@@ -269,6 +343,7 @@ while ($true) {
             if (-not (Test-Path $assetKey)) { New-Item -Path $assetKey -Force | Out-Null }
             Set-ItemProperty -Path $assetKey -Name $item -Value $no
             Write-Ok "$item = $no"
+            Save-AssetBackup   # keep the format-surviving share copy current
 
             # The PC's own number also feeds the legacy value + the computer
             # description, exactly as rename-pc does - one behavior, not two.
@@ -290,6 +365,7 @@ while ($true) {
             Remove-ItemProperty -Path $assetKey -Name $match -ErrorAction SilentlyContinue
             if ($match -eq 'PC') { Remove-ItemProperty -Path $orgKey -Name 'AssetNo' -ErrorAction SilentlyContinue }
             Write-Ok "removed $match"
+            Save-AssetBackup
         }
         '^0?$' { Write-Host '  Done.' -ForegroundColor Green; return }
         default { Write-Warn "Invalid choice: '$choice'" }
