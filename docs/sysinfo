@@ -90,6 +90,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 # <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
 $Site = @{
+    Site      = ''
     ShareRoot = ''
     ShareBase = ''
     Subnet    = ''
@@ -125,19 +126,37 @@ if (-not $primaryIp) { $primaryIp = 'no-ip' }
 #   2. Else scan C:\Users, skip built-ins and IT users, pick the most
 #      active profile based on Documents/Desktop/Downloads activity.
 #
-# To exclude additional IT staff later, just add their account name to
-# the $itUsers list below (case-insensitive).
-$itUsers = $Site.ItUsers
+# To exclude additional IT staff later, add their account name to ItUsers in
+# config/site.psd1 and run distribute.ps1 -Sync.
+#
+# Get-PrimaryUser is SHARED: printer (share names) uses the same injected
+# function, so reports and printer shares always agree on who owns a desk.
+# <#FUNCTIONS#>  generated from config/functions.ps1 by distribute.ps1 -Sync - do not edit by hand
+function Get-OrgRegKey {
+    # The registry home for ORG metadata stored on a PC (asset number, and
+    # whatever comes later). Named after the org, not the toolmaker:
+    # HKLM:\SOFTWARE\FC on site, HKLM:\SOFTWARE\Org in the generic build.
+    $org = if ($Site -and $Site.Site) { $Site.Site } else { 'Org' }
+    return "HKLM:\SOFTWARE\$org"
+}
 
-# Built-in Windows profile folders to always skip when scanning C:\Users.
-$systemProfiles = @('Default','Default User','Public','All Users','defaultuser0',
-                    'WDAGUtilityAccount')
+function Test-AssetNo([string]$no) {
+    # Maldives MoF fixed-asset register number, as procurement issues them:
+    #   {office}-{year}-{catNo}-{typeNo}-{serial}   e.g. 146-2024-03-073-0001
+    # (office code 2-4 alphanumeric - FC's MoF office code is 146; year YYYY;
+    # category 01-09 or 290, IT hardware is 03 Equipment; type 3 digits;
+    # serial 4 digits.) Same rule as the kd-server asset module - see its
+    # docs/ASSET_MANAGEMENT_SPEC.md, built on the MoF Asset Master Data Form
+    # / fixed-asset policy (IPSAS 17).
+    return $no -match '^[A-Z0-9]{2,4}-\d{4}-(0[1-9]|290)-\d{3}-\d{4}$'
+}
 
 function Get-PrimaryUser {
     # THE RULE: the most RECENTLY ACTIVE user owns the PC.
     #
     # Not "whoever is logged in" - that hands the PC to a relief staff member
-    # who happened to be at the desk during the scan.
+    # (or the IT person standing at the keyboard) who happened to be at the
+    # desk during the scan.
     #
     # Not "whoever has the most files" either. That was the old rule, and it
     # gets a reassigned PC permanently wrong: a leaver with 3,000 stale
@@ -151,6 +170,16 @@ function Get-PrimaryUser {
     # running this scan ALWAYS has the freshest one. Ranking on it would hand
     # every PC in the office to whoever did the scanning. It is therefore used
     # ONLY as a fallback, never as the recency signal - see below.
+    #
+    # IT/admin accounts come from $Site.ItUsers (site.psd1); returns a profile
+    # name like 'reemaa.abdulrahmaan', or 'unknown'.
+
+    $itUsers = @()
+    if ($Site -and $Site.ItUsers) { $itUsers = @($Site.ItUsers | ForEach-Object { $_.ToLower() }) }
+
+    # Built-in Windows profile folders to always skip when scanning C:\Users.
+    $systemProfiles = @('Default','Default User','Public','All Users','defaultuser0',
+                        'WDAGUtilityAccount')
 
     $svc = @('SYSTEM','LOCALSYSTEM','LOCAL SERVICE','NETWORK SERVICE','DWM-1','UMFD-0','UMFD-1')
     $me  = $env:USERNAME
@@ -239,6 +268,133 @@ function Get-PrimaryUser {
     if ($me) { return $me }
     return 'unknown'
 }
+# <#/FUNCTIONS#>
+#  block that distribute.ps1 -Sync refills from this file - same machinery as
+#  the <#SITE#> block. Edit here, run -Sync, and every tool agrees again.
+#
+#  Everything in this file must be GENERIC: site values come from $Site (the
+#  tool's own SITE block), never inline - the same body ships in the public
+#  builds and must pass the leak gate.
+# =============================================================================
+
+function Get-PrimaryUser {
+    # THE RULE: the most RECENTLY ACTIVE user owns the PC.
+    #
+    # Not "whoever is logged in" - that hands the PC to a relief staff member
+    # (or the IT person standing at the keyboard) who happened to be at the
+    # desk during the scan.
+    #
+    # Not "whoever has the most files" either. That was the old rule, and it
+    # gets a reassigned PC permanently wrong: a leaver with 3,000 stale
+    # documents outranks the new owner with 40 fresh ones, forever.
+    #
+    # So we rank by the LAST TIME the person actually did work - the newest
+    # write in their Documents / Desktop / Downloads. File count survives only
+    # as a tiebreak, and to prove a profile is real rather than a single logon.
+    #
+    # THE TRAP: NTUSER.DAT is rewritten on every logon, so the IT person
+    # running this scan ALWAYS has the freshest one. Ranking on it would hand
+    # every PC in the office to whoever did the scanning. It is therefore used
+    # ONLY as a fallback, never as the recency signal - see below.
+    #
+    # IT/admin accounts come from $Site.ItUsers (site.psd1); returns a profile
+    # name like 'reemaa.abdulrahmaan', or 'unknown'.
+
+    $itUsers = @()
+    if ($Site -and $Site.ItUsers) { $itUsers = @($Site.ItUsers | ForEach-Object { $_.ToLower() }) }
+
+    # Built-in Windows profile folders to always skip when scanning C:\Users.
+    $systemProfiles = @('Default','Default User','Public','All Users','defaultuser0',
+                        'WDAGUtilityAccount')
+
+    $svc = @('SYSTEM','LOCALSYSTEM','LOCAL SERVICE','NETWORK SERVICE','DWM-1','UMFD-0','UMFD-1')
+    $me  = $env:USERNAME
+
+    $candidates = Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+        Where-Object {
+            $name = $_.Name
+            ($systemProfiles -notcontains $name) -and
+            ($name -notmatch '^\.|\$$') -and
+            ($svc -notcontains $name.ToUpper())
+        }
+
+    $scored = foreach ($p in $candidates) {
+        $folders = @(
+            (Join-Path $p.FullName 'Documents'),
+            (Join-Path $p.FullName 'Desktop'),
+            (Join-Path $p.FullName 'Downloads'),
+            (Join-Path $p.FullName 'OneDrive\Documents'),
+            (Join-Path $p.FullName 'OneDrive\Desktop')
+        )
+
+        $fileCount = 0
+        $docLatest = $null      # real work: newest write in the doc folders
+        foreach ($f in $folders) {
+            # NTFS denies other users' Documents unless we are admin. Skip
+            # quietly - that case is handled by the fallback further down.
+            if (-not (Test-Path $f -ErrorAction SilentlyContinue)) { continue }
+            $items = Get-ChildItem $f -File -Depth 1 -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 500
+            $fileCount += @($items).Count
+            $maxDate = ($items | Measure-Object LastWriteTime -Maximum -ErrorAction SilentlyContinue).Maximum
+            if ($maxDate -and (-not $docLatest -or $maxDate -gt $docLatest)) { $docLatest = $maxDate }
+        }
+
+        # Logon time. Kept SEPARATE from $docLatest, and deliberately never
+        # mixed into it - see THE TRAP above.
+        $loginLatest = $null
+        $ntu = Join-Path $p.FullName 'NTUSER.DAT'
+        if (Test-Path $ntu -ErrorAction SilentlyContinue) {
+            $loginLatest = (Get-Item $ntu -Force -ErrorAction SilentlyContinue).LastWriteTime
+        }
+
+        [pscustomobject]@{
+            Name        = $p.Name
+            Files       = $fileCount
+            DocLatest   = $docLatest
+            LoginLatest = $loginLatest
+            IsIT        = ($itUsers -contains $p.Name.ToLower())
+        }
+    }
+
+    if (-not $scored) { return 'unknown' }
+
+    # --- Rank by real work: most recent document activity first -------------
+    $active    = @($scored | Where-Object { $_.Files -gt 0 -and $_.DocLatest })
+    $ranked    = @($active | Sort-Object DocLatest, Files -Descending)
+    $bestNonIt = @($ranked | Where-Object { -not $_.IsIT }) | Select-Object -First 1
+    $bestIt    = @($ranked | Where-Object { $_.IsIT })      | Select-Object -First 1
+
+    if ($bestNonIt) {
+        # An IT profile only takes the PC off a real user if it is plainly IT's
+        # OWN workstation: more recent work AND at least twice the files.
+        if ($bestIt -and
+            $bestIt.DocLatest -gt $bestNonIt.DocLatest -and
+            $bestIt.Files -ge (2 * [Math]::Max($bestNonIt.Files, 1))) {
+            return $bestIt.Name
+        }
+        return $bestNonIt.Name
+    }
+
+    if ($bestIt) { return $bestIt.Name }   # only IT has ever worked here
+
+    # --- Fallback: no document activity was readable ------------------------
+    # We are running as a normal user, so NTFS hid everyone else's Documents.
+    # The only signals left are who is logged in, and logon times.
+    if ($me -and ($itUsers -notcontains $me.ToLower()) -and ($me -notmatch '\$$')) {
+        return $me
+    }
+
+    # Logged in as IT. Fall back to the non-IT profile with the newest logon.
+    # Not as good as document activity, but it beats naming the PC after IT.
+    $byLogin = @($scored | Where-Object { -not $_.IsIT -and $_.LoginLatest } |
+                 Sort-Object LoginLatest -Descending) | Select-Object -First 1
+    if ($byLogin) { return $byLogin.Name }
+
+    if ($me) { return $me }
+    return 'unknown'
+}
+# <#/FUNCTIONS#>
 $primaryUser = Get-PrimaryUser
 
 # User and IP lowercase; PC name uppercase (matches Windows convention,
@@ -336,6 +492,17 @@ Write-Section "SYSTEM SNAPSHOT  -  $($cs.Name)  -  $(Get-Date -Format 'yyyy-MM-d
 [pscustomobject]@{
     ComputerName = $cs.Name
     User         = "$($cs.UserName)"                                   # currently logged-in user
+    MainUser     = $primaryUser                                        # the PC's real owner (Get-PrimaryUser)
+    # Asset register number: set by rename-pc into the org's registry key
+    # (Get-OrgRegKey), BIOS asset tag as fallback when the vendor filled it.
+    AssetNo      = $(
+        $a = (Get-ItemProperty (Get-OrgRegKey) -ErrorAction SilentlyContinue).AssetNo
+        if (-not $a) {
+            $t = (Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue).SMBIOSAssetTag
+            if ($t -and $t -notmatch '^(No Asset|None|Default|To be filled|\s*$)') { $a = $t }
+        }
+        if ($a) { $a } else { '-' }
+    )
     Domain       = $cs.Domain
     Manufacturer = $cs.Manufacturer
     Model        = $cs.Model
@@ -438,14 +605,35 @@ Write-Sub "Active adapters"
 Get-NetAdapter | Where-Object Status -eq 'Up' |
     Select-Object Name, InterfaceDescription, MacAddress, LinkSpeed | Format-Table -AutoSize
 
+Write-Sub "All adapters"
+# No status filter this time: a VPN adapter (TAP, WireGuard, Tailscale...) is
+# usually DOWN when idle, so the 'Up' view above never shows it. The
+# InterfaceDescription is what gives the VPN software away.
+Get-NetAdapter | Sort-Object Status |
+    Select-Object Name, InterfaceDescription, Status, MacAddress, LinkSpeed | Format-Table -AutoSize
+
 Write-Sub "IP configuration"
-Get-NetIPConfiguration | Where-Object { $_.NetAdapter.Status -eq 'Up' } |
+# -All = every interface, not just connected ones. The CIDR line carries the
+# prefix length (10.0.0.42/24) so the fleet portal can reconcile which
+# subnet RANGES are in use, not just which addresses.
+Get-NetIPConfiguration -All |
     Select-Object InterfaceAlias,
         @{n='IPv4';e={($_.IPv4Address.IPAddress -join ', ')}},
+        @{n='CIDR';e={($_.IPv4Address | ForEach-Object { "$($_.IPAddress)/$($_.PrefixLength)" }) -join ', '}},
         @{n='Gateway';e={$_.IPv4DefaultGateway.NextHop}},
         # AddressFamily 2 = IPv4 (vs 23 = IPv6). We only want IPv4 DNS here.
         @{n='DNS';e={($_.DNSServer | Where-Object AddressFamily -eq 2).ServerAddresses -join ', '}} |
     Format-List
+
+Write-Sub "VPN profiles"
+# Windows-native VPN connections configured on this PC (rasphone book).
+# Third-party clients (OpenVPN GUI, WireGuard app) don't appear here - but
+# their adapters do, in "All adapters" above.
+try {
+    $vpn = @(Get-VpnConnection -ErrorAction Stop)
+    if ($vpn) { $vpn | Select-Object Name, ServerAddress, TunnelType, ConnectionStatus | Format-Table -AutoSize }
+    else      { Write-Host "(none)" }
+} catch { Write-Host "(none)" }
 
 Write-Sub "Public IP"
 # ipify.org is a free no-auth service that returns just your public IPv4.
@@ -485,6 +673,15 @@ Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction Silentl
         Year         = $_.YearOfManufacture
     }
 } | Format-Table -AutoSize
+
+Write-Sub "Scanners / imaging"
+# Class 'Image' = scanners + the scan side of the office copiers (their
+# "ScanGear" driver registers here); 'Camera' = webcams. The USB listing above
+# misses both whenever the device hangs off the network instead of a USB port.
+$img = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+    Where-Object { $_.Class -in 'Image','Camera' })
+if ($img) { $img | Sort-Object Class, FriendlyName | Select-Object Class, FriendlyName, Status | Format-Table -AutoSize }
+else      { Write-Host "(none)" }
 
 Write-Sub "Printers"
 Get-Printer | Select-Object Name, ShareName, DriverName, PortName, Shared, Default | Format-Table -AutoSize
