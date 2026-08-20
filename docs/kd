@@ -49,9 +49,14 @@ $tools = @(
     [pscustomobject]@{ Name = 'rename-pc';       Show = 'internal'; Desc = 'PC name protocol + asset number (admin)' }
     [pscustomobject]@{ Name = 'asset';           Show = 'both';     Desc = 'Record asset numbers for this desk (PC, monitor, ...) (admin)' }
     [pscustomobject]@{ Name = 'printer';         Show = 'internal'; Desc = 'Connect / share / remove printers + diagnostics' }
+    [pscustomobject]@{ Name = 'scan';            Show = 'internal'; Desc = 'Set up scanning (ScanGear/NAPS2 or scan-to-folder), by department (admin)' }
     [pscustomobject]@{ Name = 'printer-info';    Show = 'public';   Desc = "Show a PC's printers, remotely" }
     [pscustomobject]@{ Name = 'printer-diag';    Show = 'public';   Desc = 'Diagnose print sharing failures' }
     [pscustomobject]@{ Name = 'printer-clear';   Show = 'public';   Desc = 'Clear stuck print jobs' }
+    [pscustomobject]@{ Name = 'printer-fleet';   Show = 'internal'; Desc = 'SNMP health sweep of all printers (toner, serials, counts)' }
+    [pscustomobject]@{ Name = 'backup';          Show = 'both';     Desc = 'Rescue user data before a format - deduped, virus-safe, 2nd copy on a pen (admin)' }
+    [pscustomobject]@{ Name = 'backup-restore';  Show = 'both';     Desc = 'Check a backup and put it back on the rebuilt PC (admin)' }
+    [pscustomobject]@{ Name = 'cleanup';         Show = 'internal'; Desc = 'Flush temp, reclaim C:, free memory/browsers (admin)' }
     [pscustomobject]@{ Name = 'sysinfo';         Show = 'both';     Desc = 'PC inventory snapshot' }
     [pscustomobject]@{ Name = 'gateway-monitor'; Show = 'both';     Desc = 'Connectivity diagnostic' }
 )

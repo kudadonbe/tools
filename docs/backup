@@ -1,0 +1,1895 @@
+# =============================================================================
+#  backup.ps1  -  rescue user data before a PC is formatted
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  Takes the data off a PC that is about to be wiped and reinstalled:
+#    - walks every user profile: the WHOLE profile minus the known junk, not
+#      just Documents and Desktop
+#    - skips OneDrive cloud-only files instead of hydrating them (that would
+#      hang for hours) and lists them, so nobody thinks they were copied
+#    - drops exact duplicates: one copy is kept, and every copy that was
+#      skipped is logged together with the path of the copy that was kept
+#    - keeps malware out of the new install: Defender scans the finished
+#      backup when Defender is alive, and a sanitize ruleset quarantines
+#      executables / autorun.inf / worm shortcuts either way
+#    - writes TWO copies where it can: a partition that is not C:, and a USB
+#      pen filled by priority (documents first, then pictures, then the rest)
+#    - collects the rebuild extras: installed programs, printers, Wi-Fi keys,
+#      mapped drives, network settings, asset number, BIOS serial
+#
+#  TWO WAYS TO RUN IT
+#  ------------------
+#    1. On the PC itself, as Administrator. The normal case.
+#    2. With the disk slaved: pull it, dock it on a healthy PC, and give this
+#       tool the path (e.g. F:\Users). Use this when the PC will not boot or
+#       will not let you log in - and it is the SAFER of the two, because the
+#       Defender doing the scanning is then one you can trust.
+#
+#  HOW TO RUN
+#  ----------
+#  From the pen or share menu, pick "backup". Or directly:
+#     iex (gc <path>\backup.txt -Raw)
+#
+#  It is INTERACTIVE and takes no parameters (they cannot be passed through
+#  iex, which is how the menu launches every tool). For a repeat or unattended
+#  run these environment variables are used if set, and prompted for if not:
+#     KD_BACKUP_SRC           source, e.g. 'F:\Users' for a slaved disk
+#     KD_BACKUP_DEST          destination root, e.g. 'D:\'
+#     KD_BACKUP_DRYRUN=1      plan it and write the lists, copy nothing
+#     KD_BACKUP_NODEFENDER=1  force the sanitize-only path (for testing)
+#
+#  WHAT IT SAVES
+#  -------------
+#    <dest>\KD-Backup\<PC>_<date>\users\<profile>\...  the data
+#    <dest>\KD-Backup\<PC>_<date>\extras\              rebuild information
+#    <dest>\KD-Backup\<PC>_<date>\*.csv                what was kept, skipped,
+#                                                      deduped, quarantined
+#    <dest>\KD-Backup\<PC>_<date>\README-RESTORE.txt   how to put it back
+#  The pen gets the same folder, as much of it as fits.
+#
+#  SAFETY
+#  ------
+#  It READS the PC and WRITES to the destination. It never deletes source
+#  data, and it never lets Defender delete anything either - threats are
+#  MOVED into _quarantine\ inside the backup, never removed.
+#
+#  The one exception is opt-in behind a typed YES: if there is no other
+#  destination at all it offers to shrink C: for a rescue partition. That
+#  changes the partition table. Read the warning it prints - a rescue
+#  partition on the same disk does NOT survive a full-disk format.
+# =============================================================================
+
+$ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+#  CONSOLE
+# ---------------------------------------------------------------------------
+function Write-Head($text) {
+    Write-Host ''
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+}
+function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
+
+function Confirm-Action($prompt) { (Read-Host "  $prompt (y/n)") -match '^[Yy]' }
+
+# y/n where a bare Enter takes the default, so a run of prompts goes quickly.
+function Confirm-Default($prompt, $default) {
+    $hint = 'y/N'
+    if ($default) { $hint = 'Y/n' }
+    $a = (Read-Host "  $prompt ($hint)").Trim()
+    if (-not $a) { return $default }
+    return ($a -match '^[Yy]')
+}
+
+function Format-Size($bytes) {
+    if (-not $bytes) { return '0 B' }
+    if ($bytes -ge 1TB) { return ('{0:N1} TB' -f ($bytes / 1TB)) }
+    if ($bytes -ge 1GB) { return ('{0:N1} GB' -f ($bytes / 1GB)) }
+    if ($bytes -ge 1MB) { return ('{0:N1} MB' -f ($bytes / 1MB)) }
+    if ($bytes -ge 1KB) { return ('{0:N0} KB' -f ($bytes / 1KB)) }
+    return ('{0:N0} B' -f $bytes)
+}
+
+
+# ---------------------------------------------------------------------------
+#  WHAT COUNTS AS JUNK
+# ---------------------------------------------------------------------------
+#  Two rules here deliberately differ from files\Find-LargeUserFiles.ps1:
+#
+#   1. OneDrive is NOT excluded. That script was hunting big files; we are
+#      rescuing data, and the locally-held OneDrive files ARE the user's
+#      documents - the account may not even be recoverable. Only the
+#      cloud-only placeholders are skipped.
+#   2. Favorites is NOT excluded. Bookmarks are data people grieve for.
+#
+#  AppData is an ALLOW-list, not an exclude-list. An exclude-list there is
+#  unbounded - Local\Packages and Edge\User Data alone run to tens of GB -
+#  and it would still miss whatever cache ships next year.
+
+# Taken out of AppData. Everything else under AppData is skipped, and the
+# top-level sizes are reported so the tech can grab more by hand.
+$AppDataKeep = @(
+    'Roaming\Microsoft\Signatures'
+    'Roaming\Microsoft\Templates'
+    'Roaming\Microsoft\Sticky Notes'
+    'Roaming\Microsoft\Outlook'
+    'Roaming\Microsoft\Windows\Themes'
+    'Roaming\Mozilla\Firefox\Profiles'
+    'Roaming\Thunderbird'
+    'Roaming\Notepad++'
+    'Roaming\FileZilla'
+    'Roaming\Code\User'
+    'Roaming\PuTTY'
+    'Local\Microsoft\Outlook'
+    'Local\Microsoft\Windows\Fonts'
+    'Local\Google\Chrome\User Data\Default\Bookmarks'
+    'Local\Google\Chrome\User Data\Default\Login Data'
+    'Local\Google\Chrome\User Data\Default\Web Data'
+    'Local\Microsoft\Edge\User Data\Default\Bookmarks'
+    'Local\Microsoft\Edge\User Data\Default\Login Data'
+    'Local\Microsoft\Edge\User Data\Default\Web Data'
+    'Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\LocalState'
+)
+
+# Directory NAMES that are junk wherever they appear.
+$JunkDirNames = @(
+    'node_modules','__pycache__','.gradle','.nuget','.cargo','.m2','.conda',
+    '.npm','.yarn','.vs','.vscode-server','.ipynb_checkpoints','Package Cache',
+    'CrashDumps','Crashpad','Temp','Temporary Internet Files','INetCache',
+    'WebCache','D3DSCache','GPUCache','Code Cache','CacheStorage',
+    'ShaderCache','IndexedDB','Service Worker','blob_storage'
+)
+
+# TOP-LEVEL profile folders that are junk, or legacy junctions that only lead
+# back into the profile (they are also caught by the reparse-point test).
+$JunkTopLevel = @(
+    'Searches','Links','Contacts','Saved Games','3D Objects',
+    'MicrosoftEdgeBackups','IntelGraphicsProfiles','Application Data',
+    'Local Settings','My Documents','Cookies','NetHood','PrintHood','Recent',
+    'SendTo','Start Menu','Templates'
+)
+
+# File name patterns never worth copying.
+$JunkFilePatterns = @(
+    'NTUSER.DAT*','ntuser.ini','UsrClass.dat*','Thumbs.db','ehthumbs.db',
+    'desktop.ini','.DS_Store','IconCache.db','thumbcache_*.db',
+    'iconcache_*.db','~$*.doc*','~$*.xls*','~$*.ppt*','*.tmp','*.temp',
+    '*.partial','*.part','*.crdownload','*.dmp','*.pf','*.etl','*.evtx'
+)
+
+
+# ---------------------------------------------------------------------------
+#  SANITIZE RULESET
+# ---------------------------------------------------------------------------
+#  Three outcomes per file: COPY, QUARANTINE (copied into _quarantine\ with
+#  .blocked appended, so nothing is lost and nothing can be run by accident),
+#  or LOG (not copied, recorded with the reason).
+#
+#  This runs ALWAYS - it is not a fallback for a dead Defender, it is the
+#  floor. Defender, when it is alive, is the extra layer on top.
+
+# Quarantined wherever they are found.
+$ExeHard = @(
+    '.exe','.com','.scr','.pif','.cpl','.msi','.msp','.msc','.bat','.cmd',
+    '.vbs','.vbe','.js','.jse','.wsf','.wsh','.ps1','.psm1','.ps1xml','.hta',
+    '.jar','.reg','.dll','.sys','.ocx','.drv','.scf','.inf','.gadget',
+    '.application','.appref-ms','.msix','.appx','.chm','.url'
+)
+# Quarantined only where the risk is high. A .py under Documents\src is a
+# user's work; the same file in Downloads is a coin flip.
+$ExeSoft  = @('.py','.pyw','.sh','.pl','.rb','.ahk','.iso','.img','.vhd','.vhdx','.apk')
+$SoftRisk = '^(Downloads|Desktop|AppData)\\'
+
+# Copied - this is real work - but flagged, because a macro is how most office
+# infections actually arrive.
+$MacroDoc = @('.docm','.dotm','.xlsm','.xlsb','.xlam','.pptm','.ppam','.xll','.wll')
+
+# Copied, but nothing looked inside them when Defender was not available.
+$ArchiveExt = @('.zip','.7z','.rar','.cab','.gz','.tar','.tgz','.arj','.ace','.lzh')
+
+
+# ---------------------------------------------------------------------------
+#  PEN PRIORITY TIERS
+# ---------------------------------------------------------------------------
+#  Tier 0 (the manifests, the README, extras\) is written first and always -
+#  it is tiny, and it is the map to everything else. Then 1, 2, 3, 4 until the
+#  pen is full.
+$Tier1 = @(
+    '.doc','.docx','.dot','.dotx','.odt','.rtf','.txt','.md','.pdf','.xls',
+    '.xlsx','.xlsb','.csv','.ods','.ppt','.pptx','.odp','.one','.onepkg',
+    '.pub','.vsd','.vsdx','.mpp','.accdb','.mdb','.msg','.eml','.docm',
+    '.xlsm','.pptm','.pst'
+)
+$Tier2 = @(
+    '.jpg','.jpeg','.png','.gif','.bmp','.tif','.tiff','.heic','.webp','.svg',
+    '.ico','.psd','.ai','.cdr','.cr2','.nef','.arw','.dng','.raw'
+)
+$Tier3 = @(
+    '.mp3','.wav','.m4a','.flac','.mp4','.avi','.mkv','.mov','.wmv','.zip',
+    '.7z','.rar','.cab','.iso','.ost'
+)
+
+
+# ---------------------------------------------------------------------------
+#  PREDICATES
+# ---------------------------------------------------------------------------
+#  Attributes are tested as NUMBERS, not [IO.FileAttributes] members:
+#  RecallOnDataAccess (0x400000) does not exist as an enum member on the .NET
+#  Framework build that PowerShell 5.1 runs on, and naming it would throw.
+#    0x2 Hidden   0x4 System   0x400 ReparsePoint   0x1000 Offline
+#    0x400000 RecallOnDataAccess
+function Test-CloudPlaceholder([int]$attr) {
+    return (($attr -band 0x400) -or ($attr -band 0x1000) -or ($attr -band 0x400000))
+}
+
+function Test-JunkDir([string]$rel, [string]$name) {
+    if ($JunkDirNames -contains $name) { return $true }
+    $segs = $rel -split '\\'
+    if ($segs.Count -eq 1 -and ($JunkTopLevel -contains $name)) { return $true }
+    # AppData: allow-list. Keep the branch alive only while it is still a
+    # prefix of, or sits under, something we want.
+    if ($segs[0] -ieq 'AppData') {
+        if ($segs.Count -lt 2) { return $false }
+        $sub = ($segs[1..($segs.Count - 1)] -join '\')
+        foreach ($keep in $AppDataKeep) {
+            if ($sub -ieq $keep) { return $false }
+            if ($keep.StartsWith($sub + '\', 'OrdinalIgnoreCase')) { return $false }
+            if ($sub.StartsWith($keep + '\', 'OrdinalIgnoreCase')) { return $false }
+        }
+        return $true
+    }
+    return $false
+}
+
+function Test-JunkFile([string]$rel, [string]$name) {
+    foreach ($p in $JunkFilePatterns) { if ($name -like $p) { return $true } }
+    # A file sitting loose in AppData\Roaming or AppData\Local is not on the
+    # allow-list (which only names folders and specific files).
+    $segs = $rel -split '\\'
+    if ($segs.Count -ge 2 -and $segs[0] -ieq 'AppData') {
+        $sub = ($segs[1..($segs.Count - 1)] -join '\')
+        foreach ($keep in $AppDataKeep) {
+            if ($sub -ieq $keep) { return $false }
+            if ($sub.StartsWith($keep + '\', 'OrdinalIgnoreCase')) { return $false }
+        }
+        return $true
+    }
+    return $false
+}
+
+function Get-Tier([string]$ext, [long]$bytes) {
+    # One 30 GB .ost would otherwise swallow the whole pen ahead of 8,000
+    # documents, so the big mail stores drop below pictures.
+    if (($ext -eq '.pst' -or $ext -eq '.ost') -and $bytes -gt 2GB) { return 3 }
+    if ($Tier1 -contains $ext) { return 1 }
+    if ($Tier2 -contains $ext) { return 2 }
+    if ($Tier3 -contains $ext) { return 3 }
+    return 4
+}
+
+# Returns COPY / QUARANTINE / LOG plus the reason.
+function Get-SanitizeVerdict($file) {
+    $name = Split-Path $file.Rel -Leaf
+    $ext  = [IO.Path]::GetExtension($name).ToLower()
+
+    # autorun.inf - never, anywhere, under any circumstances.
+    if ($name -ieq 'autorun.inf') { return @('LOG', 'AUTORUN-INF') }
+
+    # Right-to-left override in the name: 'photo_gnp.exe' displays as
+    # 'photo_exe.png'. Nothing legitimate ever does this.
+    if ($name.IndexOf([char]0x202E) -ge 0 -or $name.IndexOf([char]0x202B) -ge 0) {
+        return @('QUARANTINE', 'RLO-NAME')
+    }
+
+    # Double extension: something that looks like a document, that is not one.
+    if ($name -imatch '\.(pdf|docx?|xlsx?|pptx?|jpe?g|png|gif|txt|mp4|mp3|zip|rar)\s*\.(exe|scr|com|pif|bat|cmd|vbs|js|jar|lnk|hta)$') {
+        return @('QUARANTINE', 'DOUBLE-EXTENSION')
+    }
+
+    # Shortcuts are never copied into the tree - their targets die with C:.
+    # They are recorded in shortcuts.csv with target and arguments so they can
+    # be recreated, and that list doubles as worm evidence.
+    if ($ext -eq '.lnk') { return @('LOG', 'SHORTCUT') }
+
+    # Hidden + System on a FILE outside AppData: the classic dropper.
+    if ((($file.Attr -band 0x2) -and ($file.Attr -band 0x4)) -and ($file.Rel -notmatch '^AppData\\')) {
+        return @('QUARANTINE', 'HIDDEN-SYSTEM')
+    }
+
+    if ($ExeHard -contains $ext) { return @('QUARANTINE', 'EXECUTABLE') }
+    if (($ExeSoft -contains $ext) -and ($file.Rel -imatch $SoftRisk)) {
+        return @('QUARANTINE', 'SCRIPT-IN-RISKY-FOLDER')
+    }
+    return @('COPY', '')
+}
+
+
+# ---------------------------------------------------------------------------
+#  ENUMERATION
+# ---------------------------------------------------------------------------
+function Get-ProfileDirs([string]$UsersRoot) {
+    # Same candidate filter as Get-PrimaryUser in config\functions.ps1, but
+    # taking a ROOT - that function hardcodes C:\Users, which is exactly wrong
+    # when the disk is slaved on another PC as F:.
+    $sys = @('Default','Default User','All Users','defaultuser0','WDAGUtilityAccount')
+    Get-ChildItem -LiteralPath $UsersRoot -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object {
+            ($sys -notcontains $_.Name) -and ($_.Name -notmatch '^\.|\$$')
+        }
+}
+
+function New-Skip($profile, $rel, $reason, $bytes) {
+    return [pscustomobject]@{ Profile = $profile; Rel = $rel; Reason = $reason; Bytes = $bytes }
+}
+
+# The walker. Deliberately NOT Get-ChildItem -Recurse: that follows the legacy
+# profile junctions and loops, dies at MAX_PATH with no per-subtree isolation,
+# gives no incremental feedback on a 200k-file profile, and lets one denied
+# folder poison the whole pipeline.
+function Get-BackupCandidates {
+    param([string]$ProfileRoot, [string]$ProfileName, $Files, $Skipped, [bool]$WithDownloads)
+
+    $stack   = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($ProfileRoot)
+    $rootLen = $ProfileRoot.Length
+    $seen    = 0
+    $sw      = [Diagnostics.Stopwatch]::StartNew()
+    $tick    = 0.0
+
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        $rel = ''
+        if ($dir.Length -gt $rootLen) { $rel = $dir.Substring($rootLen + 1) }
+
+        # Too deep for the .NET APIs PowerShell 5.1 uses. Do not walk it - hand
+        # the whole subtree to robocopy at copy time instead.
+        if ($dir.Length -gt 240) {
+            $Skipped.Add((New-Skip $ProfileName $rel 'PATH-TOO-LONG' 0))
+            continue
+        }
+
+        $kids = $null
+        try   { $kids = Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop }
+        catch { $Skipped.Add((New-Skip $ProfileName $rel 'DENIED' 0)); continue }
+
+        foreach ($k in $kids) {
+            $krel = $k.Name
+            if ($rel) { $krel = Join-Path $rel $k.Name }
+            $a = [int]$k.Attributes
+
+            # A reparse point is a junction, a symlink, or a cloud placeholder.
+            # NEVER descend one, and never read one.
+            if ($a -band 0x400) {
+                $reason = 'REPARSE-FILE'
+                if ($k.PSIsContainer) { $reason = 'REPARSE-DIR' }
+                $bytes = 0
+                if (-not $k.PSIsContainer) { $bytes = $k.Length }
+                $Skipped.Add((New-Skip $ProfileName $krel $reason $bytes))
+                continue
+            }
+
+            if ($k.PSIsContainer) {
+                if (-not $WithDownloads -and $krel -ieq 'Downloads') {
+                    $Skipped.Add((New-Skip $ProfileName $krel 'DOWNLOADS-EXCLUDED' 0)); continue
+                }
+                if (Test-JunkDir $krel $k.Name) {
+                    $Skipped.Add((New-Skip $ProfileName $krel 'JUNK-DIR' 0)); continue
+                }
+                $stack.Push($k.FullName)
+                continue
+            }
+
+            # OneDrive Files On-Demand. Touching a dehydrated file triggers a
+            # download: hours with a slow link, an outright failure with none.
+            if (Test-CloudPlaceholder $a) {
+                $Skipped.Add((New-Skip $ProfileName $krel 'CLOUD-PLACEHOLDER' $k.Length)); continue
+            }
+            if (Test-JunkFile $krel $k.Name) {
+                $Skipped.Add((New-Skip $ProfileName $krel 'JUNK-FILE' $k.Length)); continue
+            }
+
+            # List.Add, never $arr += - at 200k files the += is O(n squared)
+            # and simply never finishes.
+            $Files.Add([pscustomobject]@{
+                Profile = $ProfileName
+                Rel     = $krel
+                Full    = $k.FullName
+                Bytes   = [long]$k.Length
+                MTime   = $k.LastWriteTime
+                Attr    = $a
+                Tier    = 0
+                Hash    = $null
+                Verdict = 'COPY'
+                Reason  = ''
+                OnPen   = $false
+            })
+            $seen++
+        }
+
+        if ($sw.Elapsed.TotalSeconds - $tick -ge 3) {
+            $tick = $sw.Elapsed.TotalSeconds
+            Write-Step ("{0}: {1:N0} files so far ..." -f $ProfileName, $seen)
+        }
+    }
+    return $seen
+}
+
+
+# ---------------------------------------------------------------------------
+#  DEDUPE
+# ---------------------------------------------------------------------------
+#  Staging, cheapest test first:
+#    group by size    -> a size group of one is unique, and is never hashed.
+#                        That alone settles 60-80% of a real profile.
+#    0 bytes          -> keep them all, never hash. Dropping empty files would
+#                        break the folder structure for no gain at all.
+#    over 4 MB        -> hash the first 64 KB, regroup, and only then go on.
+#    still grouped    -> full SHA-256.
+$Sha = [System.Security.Cryptography.SHA256]::Create()
+
+function Get-Sha256Fast([string]$Path, [int]$MaxBytes) {
+    $fs = $null
+    try {
+        # ReadWrite share so a file another process is writing can still be read.
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        if ($MaxBytes -gt 0) {
+            $buf = New-Object byte[] $MaxBytes
+            $n   = $fs.Read($buf, 0, $MaxBytes)
+            $h   = $Sha.ComputeHash($buf, 0, $n)
+        } else {
+            $h = $Sha.ComputeHash($fs)
+        }
+        return [BitConverter]::ToString($h).Replace('-', '')
+    }
+    catch   { return $null }   # unreadable: treat as UNIQUE, never as a duplicate
+    finally { if ($fs) { $fs.Dispose() } }
+}
+
+# Which of an identical set is the original, and so the one to keep?
+#
+# WHERE it lives beats WHEN it was written, because three copies made by the
+# same drag-and-drop share a timestamp to the second and the date then decides
+# nothing. Documents and OneDrive are where people file work; Desktop is where
+# it gets parked; Downloads is where it arrives, and "- Copy" and "(2)" are
+# Windows telling you outright which one is the copy.
+# A clean copy always outranks a quarantined twin. Two files with identical
+# content can get different verdicts - report.txt and report.txt.exe are the
+# same bytes to the hasher - and keeping the quarantined one would bury the
+# user's file in _quarantine\ for no reason.
+function Get-DupeRank($f) {
+    $risk = 0
+    if ($f.Verdict -eq 'QUARANTINE') { $risk = 1 }
+    $place = 1                                                  # anywhere else
+    if ($f.Rel -imatch '^(Documents|OneDrive)\\')   { $place = 0 }
+    if ($f.Rel -imatch '^Downloads\\')              { $place = 2 }
+    if ($f.Rel -imatch '- Copy|\(\d+\)\.|\bCopy of ') { $place = 3 }
+    return ('{0}|{1}|{2:yyyyMMddHHmmss}|{3:D5}|{4}' -f $risk, $place, $f.MTime, $f.Rel.Length, $f.Rel)
+}
+
+function Invoke-Dedupe($Files, $Dupes) {
+    $bySize = New-Object 'System.Collections.Generic.Dictionary[long, System.Collections.Generic.List[object]]'
+    foreach ($f in $Files) {
+        if (-not $bySize.ContainsKey($f.Bytes)) {
+            $bySize[$f.Bytes] = New-Object System.Collections.Generic.List[object]
+        }
+        $bySize[$f.Bytes].Add($f)
+    }
+
+    # Only same-size groups of 2+ with a non-zero size can hold a duplicate.
+    $toHash = New-Object System.Collections.Generic.List[object]
+    foreach ($k in $bySize.Keys) {
+        if ($k -le 0) { continue }
+        if ($bySize[$k].Count -lt 2) { continue }
+        foreach ($f in $bySize[$k]) { $toHash.Add($f) }
+    }
+
+    $hashBytes = ($toHash | Measure-Object Bytes -Sum).Sum
+    if (-not $hashBytes) { $hashBytes = 0 }
+    if ($toHash.Count -eq 0) {
+        Write-Ok 'no two files even share a size - nothing to dedupe.'
+        return $Files
+    }
+
+    Write-Host ("      {0:N0} file(s), {1}, share a size with another file." -f $toHash.Count, (Format-Size $hashBytes)) -ForegroundColor DarkGray
+    Write-Dim  'Those have to be read and hashed to tell copies from coincidences.'
+    Write-Dim  'On a healthy disk that runs at 100-300 MB/s; on a failing one, 40.'
+    if (-not (Confirm-Default 'Check them for duplicates?' $true)) {
+        Write-Warn 'Dedupe skipped - the backup will be as big as the source.'
+        return $Files
+    }
+
+    # Quick pass: 64 KB prefix on anything big, to break the size groups apart
+    # before paying for a full read.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $tick = 0.0
+    $done = 0
+    $doneBytes = 0
+    foreach ($f in $toHash) {
+        $quick = $null
+        if ($f.Bytes -gt 4MB) { $quick = Get-Sha256Fast $f.Full 65536 }
+        $f | Add-Member -NotePropertyName QuickHash -NotePropertyValue $quick -Force
+        $done++
+        if ($sw.Elapsed.TotalSeconds - $tick -ge 3) {
+            $tick = $sw.Elapsed.TotalSeconds
+            Write-Step ("quick pass {0:N0}/{1:N0}" -f $done, $toHash.Count)
+        }
+    }
+
+    # Regroup on size + quick hash. A group of one here is unique.
+    $byQuick = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]'
+    foreach ($f in $toHash) {
+        $key = '{0}:{1}' -f $f.Bytes, $f.QuickHash
+        if (-not $byQuick.ContainsKey($key)) {
+            $byQuick[$key] = New-Object System.Collections.Generic.List[object]
+        }
+        $byQuick[$key].Add($f)
+    }
+
+    $full = New-Object System.Collections.Generic.List[object]
+    foreach ($k in $byQuick.Keys) {
+        if ($byQuick[$k].Count -lt 2) { continue }
+        foreach ($f in $byQuick[$k]) { $full.Add($f) }
+    }
+    $fullBytes = ($full | Measure-Object Bytes -Sum).Sum
+    if (-not $fullBytes) { $fullBytes = 0 }
+    Write-Step ("full hash needed on {0:N0} file(s), {1}" -f $full.Count, (Format-Size $fullBytes))
+
+    $sw.Restart(); $tick = 0.0; $done = 0; $doneBytes = 0
+    foreach ($f in $full) {
+        $f.Hash = Get-Sha256Fast $f.Full 0
+        $done++
+        $doneBytes += $f.Bytes
+        if ($sw.Elapsed.TotalSeconds - $tick -ge 3) {
+            $tick = $sw.Elapsed.TotalSeconds
+            $mbs = 0
+            if ($sw.Elapsed.TotalSeconds -gt 0) { $mbs = [math]::Round(($doneBytes / 1MB) / $sw.Elapsed.TotalSeconds, 1) }
+            Write-Step ("hashing {0:N0}/{1:N0}  {2}  {3} MB/s" -f $done, $full.Count, (Format-Size $doneBytes), $mbs)
+        }
+    }
+
+    # Same size AND same full hash = the same file. A null hash means we could
+    # not read it, so it is kept - that is the difference between a bug and a
+    # data-loss bug.
+    $byHash = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[object]]'
+    foreach ($f in $full) {
+        if (-not $f.Hash) { continue }
+        $key = '{0}:{1}' -f $f.Bytes, $f.Hash
+        if (-not $byHash.ContainsKey($key)) {
+            $byHash[$key] = New-Object System.Collections.Generic.List[object]
+        }
+        $byHash[$key].Add($f)
+    }
+
+    $drop = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($k in $byHash.Keys) {
+        $grp = $byHash[$k]
+        if ($grp.Count -lt 2) { continue }
+        $ordered = @($grp | Sort-Object { Get-DupeRank $_ })
+        $keep = $ordered[0]
+        foreach ($d in $ordered[1..($ordered.Count - 1)]) {
+            $Dupes.Add([pscustomobject]@{
+                Profile             = $d.Profile
+                Kept                = ('{0}\{1}' -f $keep.Profile, $keep.Rel)
+                Duplicate           = $d.Rel
+                Bytes               = $d.Bytes
+                SHA256              = $d.Hash
+                KeptLastWrite       = $keep.MTime
+                DuplicateLastWrite  = $d.MTime
+                DuplicateSourcePath = $d.Full
+            })
+            [void]$drop.Add($d.Full)
+        }
+    }
+
+    $kept = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $Files) { if (-not $drop.Contains($f.Full)) { $kept.Add($f) } }
+    return $kept
+}
+
+
+# ---------------------------------------------------------------------------
+#  DEFENDER
+# ---------------------------------------------------------------------------
+#  Four independent signals, because each of them fails a different way: the
+#  cmdlet missing (uninstalled, tampered, or a Server SKU), the service
+#  stopped (killed by malware, or by a half-removed third-party AV), the AM
+#  service disabled by policy, or the engine reporting itself off.
+function Test-DefenderAlive {
+    if ($env:KD_BACKUP_NODEFENDER -eq '1') { return $false }
+    $st = $null
+    try { $st = Get-MpComputerStatus -ErrorAction Stop } catch { return $false }
+    if (-not $st) { return $false }
+    $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+    if (-not $svc -or $svc.Status -ne 'Running') { return $false }
+    if (-not $st.AMServiceEnabled) { return $false }
+    if (-not $st.AntivirusEnabled) { return $false }
+    return $true
+}
+
+# The copy under Program Files is often stale; the live engine lives in the
+# versioned Platform folder.
+function Get-MpCmdRun {
+    $plat = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Platform'
+    if (Test-Path $plat) {
+        $newest = Get-ChildItem $plat -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+        if ($newest) {
+            $p = Join-Path $newest.FullName 'MpCmdRun.exe'
+            if (Test-Path $p) { return $p }
+        }
+    }
+    $p = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+    if (Test-Path $p) { return $p }
+    return $null
+}
+
+# Scan a finished backup folder. -DisableRemediation is not negotiable: this
+# is the user's only copy of their data, so we report and WE decide - and our
+# decision is always to move, never to delete.
+function Invoke-DefenderScan([string]$Path) {
+    $result = [pscustomobject]@{ Ran = $false; Signatures = ''; Threats = @(); Note = '' }
+
+    Write-Step 'updating Defender signatures ...'
+    try {
+        Update-MpSignature -ErrorAction Stop
+        $result.Signatures = (Get-MpComputerStatus).AntivirusSignatureVersion
+        Write-Ok ("signatures now {0}" -f $result.Signatures)
+    } catch {
+        $st  = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        $age = 'unknown'
+        if ($st) { $age = $st.AntivirusSignatureAge; $result.Signatures = $st.AntivirusSignatureVersion }
+        Write-Warn "could not update signatures: $($_.Exception.Message)"
+        Write-Warn "scanning with signatures $age day(s) old. The sanitize rules stay on."
+    }
+
+    $start = Get-Date
+    $mp = Get-MpCmdRun
+    Write-Step 'scanning the backup (this takes a while) ...'
+    try {
+        if ($mp) {
+            & $mp -Scan -ScanType 3 -File $Path -DisableRemediation 2>&1 | ForEach-Object {
+                if ($_ -match 'found|Threat|threat') { Write-Dim $_ }
+            }
+        } else {
+            # Fallback. Tidier cmdlet, but no progress and it cannot always be
+            # told to leave things alone.
+            Start-MpScan -ScanType CustomScan -ScanPath $Path -ErrorAction Stop
+        }
+        $result.Ran = $true
+    } catch {
+        $result.Note = "scan failed: $($_.Exception.Message)"
+        Write-Bad $result.Note
+        return $result
+    }
+
+    # Exit codes are unreliable across builds, so the outcome comes from the
+    # detection list, whose Resources carry the actual file paths.
+    $hits = @(Get-MpThreatDetection -ErrorAction SilentlyContinue |
+              Where-Object { $_.InitialDetectionTime -ge $start })
+    $result.Threats = $hits
+    return $result
+}
+
+
+# ---------------------------------------------------------------------------
+#  SHORTCUT-WORM CHECK
+# ---------------------------------------------------------------------------
+#  The classic USB worm: your folders are made Hidden+System and replaced with
+#  same-named .lnk files that run the payload and then open the real folder.
+#  Both the source (if it is removable) and the destination pen get checked.
+function Test-ShortcutWorm([string]$Root) {
+    $hits = @()
+    $kids = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue)
+    $hiddenDirs = @($kids | Where-Object {
+        $_.PSIsContainer -and ([int]$_.Attributes -band 0x2) -and ([int]$_.Attributes -band 0x4)
+    })
+    $lnks = @($kids | Where-Object { $_.Extension -ieq '.lnk' })
+    if (-not $lnks) { return $hits }
+    $wsh = $null
+    try { $wsh = New-Object -ComObject WScript.Shell } catch { return $hits }
+    foreach ($l in $lnks) {
+        $sc = $null
+        try { $sc = $wsh.CreateShortcut($l.FullName) } catch { continue }
+        $blob = "$($sc.TargetPath) $($sc.Arguments)"
+        $twin = @($hiddenDirs | Where-Object { $_.Name -eq [IO.Path]::GetFileNameWithoutExtension($l.Name) })
+        if ($twin.Count -gt 0 -or $blob -imatch 'cmd\.exe|wscript|cscript|rundll32|mshta|powershell|\.vbs|\.js\b') {
+            $hits += [pscustomobject]@{ Lnk = $l.Name; Target = $sc.TargetPath; Args = $sc.Arguments }
+        }
+    }
+    return $hits
+}
+
+
+# ---------------------------------------------------------------------------
+#  VOLUMES AND DESTINATION
+# ---------------------------------------------------------------------------
+#  DriveType 2 = removable, 3 = fixed. Some USB3 sticks report as fixed, which
+#  is why every tool in this kit walks both - see Find-PenFolder in sysinfo.
+function Get-WritableVolumes {
+    $out = @()
+    foreach ($dt in 2, 3) {
+        $disks = @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=$dt" -ErrorAction SilentlyContinue)
+        foreach ($d in $disks) {
+            if (-not $d.Size) { continue }
+            $kind = 'fixed'
+            if ($dt -eq 2) { $kind = 'removable' }
+            $out += [pscustomobject]@{
+                Letter     = $d.DeviceID
+                Label      = $d.VolumeName
+                FileSystem = $d.FileSystem
+                Size       = [long]$d.Size
+                Free       = [long]$d.FreeSpace
+                Kind       = $kind
+            }
+        }
+    }
+    return $out | Sort-Object Letter -Unique
+}
+
+function Test-Writable([string]$Root) {
+    $probe = Join-Path $Root 'kd-write-test.tmp'
+    try {
+        Set-Content -LiteralPath $probe -Value 'ok' -ErrorAction Stop
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch { return $false }
+}
+
+function Show-Volumes($vols, [long]$Need) {
+    Write-Host ''
+    Write-Host ('   #  Drive  Label                 FS       Size      Free    Verdict') -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $vols.Count; $i++) {
+        $v = $vols[$i]
+        $verdict = 'fits'
+        $col = 'Green'
+        if ($v.Free -lt $Need) { $verdict = 'too small'; $col = 'Yellow' }
+        if ($v.FileSystem -eq 'FAT32') { $verdict = "$verdict, FAT32 (no file over 4 GB)" }
+        $label = $v.Label
+        if (-not $label) { $label = '(no label)' }
+        Write-Host ("  {0,2}  {1,-5}  {2,-20}  {3,-6} {4,8} {5,8}   {6}" -f `
+            ($i + 1), $v.Letter, $label, $v.FileSystem, (Format-Size $v.Size), (Format-Size $v.Free), $verdict) -ForegroundColor $col
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+#  SHRINK C:  -  the last resort, and the weakest thing in this tool
+# ---------------------------------------------------------------------------
+#  A rescue partition lives on the SAME PHYSICAL DISK as C:. It survives a
+#  "format C: only" reinstall and nothing else. Every other destination is
+#  better, and the tool says so before it offers this.
+function Invoke-ShrinkForRescue {
+    param([long]$NeedBytes, [bool]$HavePenCopy, [string]$SourceRoot)
+
+    Write-Sub 'SHRINK C: TO MAKE A RESCUE PARTITION  (last resort)'
+
+    # G1  live C: only. Shrinking a slaved foreign disk, from a machine that
+    #     will not boot it, achieves nothing.
+    if ($SourceRoot -notmatch '^[Cc]:\\') {
+        Write-Bad 'Shrink is only offered when the data is on THIS PC''s own C:.'
+        return $null
+    }
+
+    $part = $null
+    try { $part = Get-Partition -DriveLetter C -ErrorAction Stop }
+    catch { Write-Bad "Cannot read the C: partition: $($_.Exception.Message)"; return $null }
+
+    $disk = Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue
+
+    # G2  physical disk health
+    $pd = Get-PhysicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.DeviceId -eq [string]$part.DiskNumber }
+    if ($pd -and ($pd.HealthStatus -ne 'Healthy' -or $pd.OperationalStatus -ne 'OK')) {
+        Write-Bad ("This disk reports HealthStatus={0}, OperationalStatus={1}." -f $pd.HealthStatus, $pd.OperationalStatus)
+        Write-Bad 'Repartitioning a failing disk is the fastest way to lose everything.'
+        Write-Warn 'Borrow an external drive or a bigger pen instead.'
+        return $null
+    }
+
+    # G3  SMART failure prediction
+    $smart = @(Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction SilentlyContinue |
+               Where-Object { $_.PredictFailure })
+    if ($smart.Count -gt 0) {
+        Write-Bad 'SMART predicts imminent failure on a disk in this PC. Refusing to repartition.'
+        return $null
+    }
+
+    # G4  BitLocker
+    $bl = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction SilentlyContinue
+    if ($bl -and $bl.ProtectionStatus -eq 'On') {
+        Write-Bad 'C: is BitLocker-protected.'
+        Write-Warn 'Suspend it first (manage-bde -protectors -disable C:) and make sure you'
+        Write-Warn 'have the recovery key. Refusing to shrink an encrypted volume.'
+        return $null
+    }
+
+    # G5  MBR four-primary-partition limit
+    if ($disk -and $disk.PartitionStyle -eq 'MBR') {
+        $count = @(Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue).Count
+        if ($count -ge 4) {
+            Write-Bad 'This is an MBR disk with 4 primary partitions - there is no room for another.'
+            return $null
+        }
+    }
+
+    # G6  is there anything to shrink?
+    $sup = $null
+    try { $sup = Get-PartitionSupportedSize -DriveLetter C -ErrorAction Stop }
+    catch { Write-Bad "Windows would not report the shrink limit: $($_.Exception.Message)"; return $null }
+
+    $shrinkBy = [long]($NeedBytes * 1.10)
+    if ($shrinkBy -lt 10GB) { $shrinkBy = 10GB }
+    $movable = $part.Size - $sup.SizeMin
+    if ($movable -lt $shrinkBy) {
+        Write-Bad ("C: can only give up {0} - the backup needs {1}." -f (Format-Size $movable), (Format-Size $shrinkBy))
+        Write-Warn 'Unmovable files are pinning it: the page file, hibernation, restore'
+        Write-Warn 'points, the MFT. To free them up, in an admin window:'
+        Write-Warn '    powercfg /h off'
+        Write-Warn '    vssadmin delete shadows /all /quiet'
+        Write-Warn '    (then run the cleanup tool, and try this again)'
+        return $null
+    }
+
+    # G7  leave C: usable
+    $newSize    = $part.Size - $shrinkBy
+    $cFreeAfter = (Get-Volume -DriveLetter C).SizeRemaining - $shrinkBy
+    $minKeep    = [Math]::Max(20GB, [long]($part.Size * 0.15))
+    if ($cFreeAfter -lt $minKeep) {
+        Write-Bad ("That would leave C: with only {0} free; Windows needs at least {1}." -f (Format-Size $cFreeAfter), (Format-Size $minKeep))
+        return $null
+    }
+
+    # G8  the honest warning, then a typed YES
+    Write-Host ''
+    Write-Warn 'READ THIS BEFORE YOU TYPE ANYTHING:'
+    Write-Warn '  - A rescue partition sits on the SAME PHYSICAL DISK as C:.'
+    Write-Warn '  - If the rebuild does a FULL-DISK format, which is the usual case,'
+    Write-Warn '    this partition is DESTROYED along with C:. Only the USB pen copy'
+    Write-Warn '    survives that.'
+    Write-Warn '  - If the disk itself is dying, this saves nothing at all.'
+    Write-Warn '  - Shrinking is normally safe, but it moves live data. There is no'
+    Write-Warn '    undo, and a power cut during it can cost the whole volume.'
+    Write-Host ''
+    Write-Host ("  Plan:  C:  {0}  ->  {1}" -f (Format-Size $part.Size), (Format-Size $newSize))
+    Write-Host ("         new rescue partition: {0}, label KD-RESCUE" -f (Format-Size $shrinkBy))
+    Write-Host ''
+    Write-Warn 'The USB pen for the second copy is chosen straight after this. If you'
+    Write-Warn 'skip it, this partition will be the only copy of the data - and it'
+    Write-Warn 'dies with C: on a full-disk format.'
+    Write-Host ''
+    if ((Read-Host '  Type YES to shrink C: now') -ne 'YES') { Write-Warn 'Cancelled.'; return $null }
+
+    $beforeCount = @(Get-Partition -DiskNumber $part.DiskNumber -ErrorAction SilentlyContinue).Count
+
+    try {
+        Write-Step 'resizing C: - do not interrupt this ...'
+        Resize-Partition -DriveLetter C -Size $newSize -ErrorAction Stop
+        Write-Ok 'C: resized.'
+    } catch {
+        Write-Bad "Resize failed: $($_.Exception.Message)"
+        Write-Warn 'Nothing was changed. Free up the unmovable files listed above and'
+        Write-Warn 'retry, or pick a different destination.'
+        return $null
+    }
+
+    $np = $null
+    try {
+        Write-Step 'creating the rescue partition ...'
+        $np = New-Partition -DiskNumber $part.DiskNumber -UseMaximumSize -AssignDriveLetter -ErrorAction Stop
+    } catch {
+        Write-Bad "Could not create the partition: $($_.Exception.Message)"
+        Write-Warn 'C: is smaller now and the freed space is unallocated. That is harmless.'
+        Write-Warn 'Create and format it by hand in Disk Management, or pick another target.'
+        return $null
+    }
+
+    try {
+        Write-Step 'formatting NTFS ...'
+        Format-Volume -Partition $np -FileSystem NTFS -NewFileSystemLabel 'KD-RESCUE' -Confirm:$false -Force -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Bad "Format failed: $($_.Exception.Message)"
+        Write-Warn "Partition $($np.DriveLetter): exists but is raw. Format it in Disk Management."
+        return $null
+    }
+
+    # On an OEM layout (EFI | MSR | C: | WinRE) the freed extent lands BETWEEN
+    # C: and the recovery partition. -UseMaximumSize picks the largest free
+    # extent, which is that gap - correct. This assertion is what catches the
+    # case where it was not.
+    $afterCount = @(Get-Partition -DiskNumber $part.DiskNumber -ErrorAction SilentlyContinue).Count
+    if ($afterCount -ne ($beforeCount + 1)) {
+        Write-Warn 'The partition count is not what was expected. Check Disk Management'
+        Write-Warn 'before you trust this partition.'
+    }
+
+    $letter = "$($np.DriveLetter):"
+    if (-not (Test-Writable "$letter\")) { Write-Bad "Cannot write to $letter - not usable."; return $null }
+    Set-Content -LiteralPath (Join-Path "$letter\" 'DO-NOT-FORMAT-THIS-PARTITION.txt') `
+        -Value 'This partition holds the rescued user data for this PC. Do not format it.' -Encoding ASCII
+    Write-Ok ("Rescue partition ready at {0} ({1})." -f $letter, (Format-Size $np.Size))
+    return "$letter\"
+}
+
+
+# ---------------------------------------------------------------------------
+#  COPY ENGINE
+# ---------------------------------------------------------------------------
+#  [IO.File]::Copy per file, with robocopy as a targeted escape hatch.
+#
+#  Not Copy-Item: it dies on paths over 260 characters under PowerShell 5.1
+#  and carries the provider overhead 100,000 times over. Not robocopy for the
+#  whole job either: the file list here is COMPUTED (dedupe plus sanitize),
+#  robocopy takes no arbitrary include list, and one process per file at ~40 ms
+#  is over an hour of pure spawn cost on a big profile.
+#
+#  ACLs are deliberately NOT copied. New PC, new SIDs - copied ACLs guarantee
+#  "access denied" on restore. Data and timestamps only.
+function Copy-OneFile([string]$Src, [string]$Dst, $MTime) {
+    $dir = Split-Path $Dst -Parent
+    if (-not [System.IO.Directory]::Exists($dir)) {
+        # moveFiles.ps1 never did this, which is why it cannot copy a tree.
+        [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+    }
+    $err = ''
+    try { [System.IO.File]::Copy($Src, $Dst, $true) }
+    catch {
+        $err = $_.Exception.Message
+        Start-Sleep -Milliseconds 800
+        try { [System.IO.File]::Copy($Src, $Dst, $true); $err = '' }
+        catch {
+            $err = $_.Exception.Message
+            # Last resort: robocopy backup mode reads through a deny-ACL. It
+            # will not break an exclusive lock, but denial is the commoner cause.
+            $null = & robocopy.exe (Split-Path $Src -Parent) $dir (Split-Path $Src -Leaf) /B /R:1 /W:1 /NJH /NJS /NP /NFL /NDL 2>&1
+            if (Test-Path -LiteralPath $Dst) { $err = '' }
+        }
+    }
+    if ($err) { return "FAIL: $err" }
+    try {
+        # Clear Hidden/System/ReadOnly on the copy. On a worm-infected profile
+        # this is the step that makes the user's folders visible again.
+        [System.IO.File]::SetAttributes($Dst, [System.IO.FileAttributes]::Normal)
+        if ($MTime) { [System.IO.File]::SetLastWriteTime($Dst, $MTime) }
+    } catch { }
+    return 'OK'
+}
+
+# Progress: throttled Write-Host, not Write-Progress. Write-Progress writes
+# nothing to a transcript, repaints over the [FAIL] lines the tech needs to
+# see, and would be the only tool in this kit that scrolls a status bar.
+function New-Ticker { return [pscustomobject]@{ Sw = [Diagnostics.Stopwatch]::StartNew(); Last = 0.0 } }
+function Test-Tick($t) {
+    if ($t.Sw.Elapsed.TotalSeconds - $t.Last -ge 3) { $t.Last = $t.Sw.Elapsed.TotalSeconds; return $true }
+    return $false
+}
+
+
+# ---------------------------------------------------------------------------
+#  REBUILD EXTRAS
+# ---------------------------------------------------------------------------
+#  Everything you wish you had written down before you formatted. All of it is
+#  best-effort: a missing piece must never stop the data copy.
+function Save-Extras([string]$Dir, [bool]$Live) {
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+
+    if (-not $Live) {
+        Set-Content -LiteralPath (Join-Path $Dir 'NOT-COLLECTED.txt') -Encoding UTF8 -Value @(
+            'The disk was read from another PC (slaved mode), so the live settings',
+            'of the original machine - printers, Wi-Fi keys, mapped drives, network',
+            'configuration - could not be read. Only the file data was rescued.'
+        )
+        return
+    }
+
+    try {
+        $keys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName } |
+            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
+            Sort-Object DisplayName |
+            Export-Csv (Join-Path $Dir 'installed-programs.csv') -NoTypeInformation -Encoding UTF8
+        Write-Ok 'installed programs'
+    } catch { Write-Warn "installed programs: $($_.Exception.Message)" }
+
+    try {
+        $lines = @()
+        foreach ($p in (Get-Printer -ErrorAction SilentlyContinue)) {
+            $lines += ('{0}  |  {1}  |  port {2}  |  shared={3}' -f $p.Name, $p.DriverName, $p.PortName, $p.Shared)
+        }
+        foreach ($p in (Get-PrinterPort -ErrorAction SilentlyContinue)) {
+            if ($p.PrinterHostAddress) { $lines += ('PORT {0} -> {1}' -f $p.Name, $p.PrinterHostAddress) }
+        }
+        Set-Content -LiteralPath (Join-Path $Dir 'printers.txt') -Value $lines -Encoding UTF8
+        Write-Ok 'printers'
+    } catch { Write-Warn "printers: $($_.Exception.Message)" }
+
+    try {
+        $lines = @(& net.exe use 2>&1)
+        Set-Content -LiteralPath (Join-Path $Dir 'mapped-drives.txt') -Value $lines -Encoding UTF8
+        Write-Ok 'mapped drives'
+    } catch { Write-Warn "mapped drives: $($_.Exception.Message)" }
+
+    try {
+        $lines = @()
+        foreach ($n in (Get-NetIPConfiguration -ErrorAction SilentlyContinue)) {
+            $lines += ('-- {0}' -f $n.InterfaceAlias)
+            $lines += ('   IPv4    : {0}' -f ($n.IPv4Address.IPAddress -join ', '))
+            $lines += ('   Gateway : {0}' -f ($n.IPv4DefaultGateway.NextHop -join ', '))
+            $lines += ('   DNS     : {0}' -f ($n.DNSServer.ServerAddresses -join ', '))
+            $lines += ''
+        }
+        Set-Content -LiteralPath (Join-Path $Dir 'network-config.txt') -Value $lines -Encoding UTF8
+        Write-Ok 'network settings'
+    } catch { Write-Warn "network settings: $($_.Exception.Message)" }
+
+    try {
+        $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+        $cs   = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $os   = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $lines = @(
+            ('PC name     : {0}' -f $env:COMPUTERNAME),
+            ('Model       : {0} {1}' -f $cs.Manufacturer, $cs.Model),
+            ('BIOS serial : {0}' -f $bios.SerialNumber),
+            ('Domain      : {0}' -f $cs.Domain),
+            ('OS          : {0} ({1})' -f $os.Caption, $os.Version),
+            ('Backed up   : {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+        )
+        # The asset number the org keeps in the registry. The asset tool can
+        # put it back after the format, keyed on the same BIOS serial.
+        foreach ($hive in (Get-ChildItem 'HKLM:\SOFTWARE' -ErrorAction SilentlyContinue)) {
+            $ap = Get-ItemProperty (Join-Path $hive.PSPath 'Assets') -ErrorAction SilentlyContinue
+            if ($ap) {
+                foreach ($n in ($ap.PSObject.Properties.Name | Where-Object { $_ -notmatch '^PS' })) {
+                    $lines += ('Asset {0,-6}: {1}' -f $n, $ap.$n)
+                }
+            }
+        }
+        Set-Content -LiteralPath (Join-Path $Dir 'pc-identity.txt') -Value $lines -Encoding UTF8
+        Write-Ok 'PC identity and asset numbers'
+    } catch { Write-Warn "PC identity: $($_.Exception.Message)" }
+
+    if (Confirm-Default 'Export saved Wi-Fi profiles, INCLUDING the keys?' $true) {
+        try {
+            $wifi = Join-Path $Dir 'wifi'
+            New-Item -ItemType Directory -Force -Path $wifi | Out-Null
+            $null = & netsh.exe wlan export profile key=clear folder="$wifi" 2>&1
+            $n = @(Get-ChildItem $wifi -Filter '*.xml' -ErrorAction SilentlyContinue).Count
+            Write-Ok "$n Wi-Fi profile(s) - these files contain the passwords in clear text"
+        } catch { Write-Warn "Wi-Fi export: $($_.Exception.Message)" }
+    }
+}
+
+
+function Save-RestoreReadme([string]$Root, $Stats) {
+    $lines = @(
+        '===========================================================================',
+        '  HOW TO PUT THIS BACK',
+        '===========================================================================',
+        '',
+        ("  Taken from : {0}" -f $Stats.PcName),
+        ("  Taken on   : {0}" -f $Stats.When),
+        ("  Source     : {0}" -f $Stats.Source),
+        '',
+        '  THE SHORT VERSION',
+        '  -----------------',
+        '  The files are under  users\<profile name>\  in the same layout they had',
+        '  on the old PC. Drag Documents, Desktop, Pictures, Downloads and the rest',
+        '  into the matching folders of the new profile. Nothing here needs a tool.',
+        '',
+        '  Or run the backup-restore tool from the KUDADONBE menu: it checks the',
+        '  files against the manifest, scans them with Defender, and copies them',
+        '  back without ever overwriting anything.',
+        '',
+        '  WHAT IS IN HERE',
+        '  ---------------',
+        '  users\                  the rescued data, one folder per profile',
+        '  extras\                 installed programs, printers, Wi-Fi keys,',
+        '                          network settings, asset number, BIOS serial',
+        '  _quarantine\            files that were held back - see below',
+        '  manifest.csv            every file that was copied, with its size,',
+        '                          date and (where it was hashed) its SHA-256',
+        '  duplicates.csv          exact copies that were NOT copied twice. Every',
+        '                          row names the file that WAS kept and where it',
+        '                          is. Nothing in this list is lost.',
+        '  skipped.csv             what was left behind, and why',
+        '  placeholders.csv        files that live only in OneDrive, never on the',
+        '                          disk. They were NOT copied - sign in to OneDrive',
+        '                          on the new PC to get them back.',
+        '  shortcuts.csv           the .lnk shortcuts, with their targets, so they',
+        '                          can be recreated (their old targets are gone)',
+        '  macro-files.csv         documents with macros in them. They were copied.',
+        '                          Open them in Protected View first.',
+        '  quarantine.csv          what went into _quarantine\ and why',
+        '  unreadable.csv          files that could not be read at all',
+        '  scan.txt                what the virus check found',
+        '',
+        '  ABOUT _quarantine\',
+        '  ------------------',
+        '  Programs, scripts, installers and anything that looked like malware were',
+        '  copied in there with .blocked added to the name, so they cannot run by',
+        '  accident. NOTHING WAS DELETED. If you need one of them, check it first,',
+        '  then rename it to remove .blocked.',
+        '',
+        '  Do not restore _quarantine\ wholesale onto the rebuilt PC.',
+        '',
+        '  A WARNING ABOUT WHERE THIS IS',
+        '  -----------------------------',
+        '  If this copy is on a partition of the same disk as the old C:, a',
+        '  full-disk format destroys it too. Check that a second copy exists on a',
+        '  USB pen or another drive BEFORE you start the reinstall.',
+        '',
+        '===========================================================================',
+        '  KUDADONBE (KD)  -  Computer Consultancy',
+        '  kudadonbe@outlook.com',
+        '==========================================================================='
+    )
+    Set-Content -LiteralPath (Join-Path $Root 'README-RESTORE.txt') -Value $lines -Encoding UTF8
+}
+
+
+# ===========================================================================
+#  MAIN
+# ===========================================================================
+Write-Head 'BACKUP  -  rescue user data before a format'
+
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Bad 'This must be run as Administrator.'
+    Write-Host '      Other people''s profiles are unreadable without it, and half the' -ForegroundColor Yellow
+    Write-Host '      data would be missed in silence. Close this window, right-click' -ForegroundColor Yellow
+    Write-Host '      PowerShell -> Run as administrator, then start the tool again.' -ForegroundColor Yellow
+    return
+}
+
+$dryRun = ($env:KD_BACKUP_DRYRUN -eq '1')
+if ($dryRun) { Write-Warn 'DRY RUN - it will plan everything and write the lists, but copy nothing.' }
+
+# --- the machine we are standing at ---------------------------------------
+Write-Sub 'THIS MACHINE'
+Write-Host ("  PC     : {0}" -f $env:COMPUTERNAME)
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    Write-Host ("  OS     : {0}" -f $os.Caption)
+} catch { }
+
+Write-Sub 'DISKS'
+try {
+    Get-PhysicalDisk -ErrorAction SilentlyContinue |
+        Select-Object DeviceId, FriendlyName, MediaType, BusType, HealthStatus,
+                      @{n='SizeGB';e={[math]::Round($_.Size / 1GB, 0)}} |
+        Format-Table -AutoSize | Out-Host
+} catch { Write-Warn 'could not read the physical disks' }
+
+$vols = @(Get-WritableVolumes)
+Show-Volumes $vols 0
+$badHealth = @(Get-PhysicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.HealthStatus -ne 'Healthy' })
+if ($badHealth.Count -gt 0) {
+    Write-Host ''
+    Write-Bad 'At least one disk in this PC is NOT reporting Healthy.'
+    Write-Warn 'Copy the important folders first and worry about completeness second -'
+    Write-Warn 'a disk in this state can stop answering at any moment.'
+}
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 1  -  WHERE IS THE DATA
+# ---------------------------------------------------------------------------
+Write-Sub 'WHERE IS THE DATA'
+$srcUsersRoot = ''
+if ($env:KD_BACKUP_SRC) {
+    $srcUsersRoot = $env:KD_BACKUP_SRC
+    Write-Step "using KD_BACKUP_SRC = $srcUsersRoot"
+} else {
+    Write-Host '  1.  This PC            C:\Users'
+    Write-Host '  2.  Another disk       slaved or USB-docked - you type the path'
+    Write-Host '  3.  A single folder    any path at all'
+    Write-Host '  0.  Cancel'
+    $pick = (Read-Host '  Choice').Trim()
+    if ($pick -eq '1' -or $pick -eq '') { $srcUsersRoot = 'C:\Users' }
+    elseif ($pick -eq '2' -or $pick -eq '3') {
+        Write-Host ''
+        Write-Dim 'For a slaved disk this is normally <letter>:\Users - the tool will'
+        Write-Dim 'offer that for you if you just give it the drive letter.'
+        $typed = (Read-Host '  Path').Trim().Trim('"')
+        if (-not $typed) { Write-Warn 'Nothing entered. Cancelled.'; return }
+        if ($typed -match '^[A-Za-z]:\\?$') {
+            $root = $typed.TrimEnd('\')
+            $u = Join-Path $root 'Users'
+            $w = Join-Path $root 'Windows'
+            if (Test-Path -LiteralPath $u) {
+                Write-Ok "found $u - that looks like a Windows disk."
+                $srcUsersRoot = $u
+            } elseif (Test-Path -LiteralPath $w) {
+                Write-Warn "$root has Windows but no Users folder. Using the drive root."
+                $srcUsersRoot = $root
+            } else {
+                $srcUsersRoot = $root
+            }
+        } else {
+            $srcUsersRoot = $typed
+        }
+    } else { Write-Warn 'Cancelled.'; return }
+}
+
+if (-not (Test-Path -LiteralPath $srcUsersRoot)) {
+    Write-Bad "$srcUsersRoot does not exist."
+    return
+}
+# The PC this data BELONGS to. In slaved mode this machine's name is wrong.
+$isLive = ($srcUsersRoot -match '^[Cc]:\\')
+$pcName = $env:COMPUTERNAME
+if (-not $isLive) {
+    $typedName = (Read-Host "  Name of the PC this disk came from (Enter = UNKNOWN-PC)").Trim()
+    $pcName = 'UNKNOWN-PC'
+    if ($typedName) { $pcName = ($typedName -replace '[^\w\.-]', '_') }
+    Write-Ok 'Slaved mode. This is the safer way to do it: the Defender that scans'
+    Write-Dim 'the rescued files is this healthy PC''s, not the sick one''s.'
+}
+
+# --- pick the profiles -----------------------------------------------------
+$profileDirs = @(Get-ProfileDirs $srcUsersRoot)
+if ($profileDirs.Count -eq 0) {
+    # Not a Users folder - treat whatever was given as one big "profile".
+    Write-Warn "No user profiles under $srcUsersRoot - treating it as a single folder."
+    $profileDirs = @(Get-Item -LiteralPath $srcUsersRoot)
+}
+
+Write-Sub 'PROFILES'
+for ($i = 0; $i -lt $profileDirs.Count; $i++) {
+    $p = $profileDirs[$i]
+    $last = 'unknown'
+    $docs = Join-Path $p.FullName 'Documents'
+    $probe = $p.FullName
+    if (Test-Path -LiteralPath $docs) { $probe = $docs }
+    $newest = Get-ChildItem -LiteralPath $probe -File -Force -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newest) { $last = $newest.LastWriteTime.ToString('yyyy-MM-dd') }
+    Write-Host ("  {0,2}.  {1,-28}  last document {2}" -f ($i + 1), $p.Name, $last)
+}
+Write-Host ''
+$sel = (Read-Host '  Which? (Enter = all, or 1,3,4)').Trim()
+$chosen = $profileDirs
+if ($sel) {
+    $idx = @($sel -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ - 1 })
+    $chosen = @($idx | Where-Object { $_ -ge 0 -and $_ -lt $profileDirs.Count } | ForEach-Object { $profileDirs[$_] })
+}
+if ($chosen.Count -eq 0) { Write-Warn 'No profile selected. Cancelled.'; return }
+Write-Ok ("{0} profile(s) selected." -f $chosen.Count)
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 2  -  OPTIONS
+# ---------------------------------------------------------------------------
+Write-Sub 'OPTIONS'
+$withDownloads = Confirm-Default 'Include Downloads? (big, often junk, and the usual way malware arrives)' $true
+$withOst       = Confirm-Default 'Include Outlook .ost cache files? (they rebuild themselves from the server)' $false
+$withExtras    = Confirm-Default 'Collect the rebuild extras (programs, printers, Wi-Fi keys, network)?' $true
+if (-not $dryRun) { $dryRun = Confirm-Default 'Dry run - plan it and write the lists, but copy nothing?' $false }
+
+# Close the apps that hold data files open. This single step fixes almost
+# every "the file is in use" failure later on - an open PST above all.
+if ($isLive) {
+    $holders = @('outlook','winword','excel','powerpnt','onenote','msaccess','msedge','chrome','firefox','teams')
+    $running = @(Get-Process -Name $holders -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        Write-Warn ("{0} app(s) are holding files open: {1}" -f $running.Count, (($running | Select-Object -Expand Name -Unique) -join ', '))
+        if (Confirm-Default 'Close them now? (anything unsaved in them is lost)' $true) {
+            foreach ($p in $running) { try { $null = $p.CloseMainWindow() } catch { } }
+            Start-Sleep -Seconds 5
+            $still = @(Get-Process -Name $holders -ErrorAction SilentlyContinue)
+            if ($still.Count -gt 0 -and (Confirm-Action 'Some are still running. Force them closed?')) {
+                foreach ($p in $still) { try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { } }
+            }
+        }
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 3  -  ENUMERATE AND ESTIMATE
+# ---------------------------------------------------------------------------
+Write-Sub 'READING THE DISK'
+Write-Dim 'Nothing is written until you have seen the numbers and typed YES.'
+
+$files   = New-Object System.Collections.Generic.List[object]
+$skipped = New-Object System.Collections.Generic.List[object]
+$swAll   = [Diagnostics.Stopwatch]::StartNew()
+
+foreach ($p in $chosen) {
+    Write-Step "walking $($p.Name) ..."
+    $n = Get-BackupCandidates $p.FullName $p.Name $files $skipped $withDownloads
+    Write-Ok ("{0}: {1:N0} file(s)" -f $p.Name, $n)
+}
+$swAll.Stop()
+
+if (-not $withOst) {
+    $ost = @($files | Where-Object { $_.Rel -imatch '\.ost$' })
+    foreach ($f in $ost) { $skipped.Add((New-Skip $f.Profile $f.Rel 'OST-EXCLUDED' $f.Bytes)) }
+    if ($ost.Count -gt 0) {
+        $keep = New-Object System.Collections.Generic.List[object]
+        foreach ($f in $files) { if ($f.Rel -notmatch '\.ost$') { $keep.Add($f) } }
+        $files = $keep
+        Write-Step ("dropped {0} Outlook .ost cache file(s), {1}" -f $ost.Count, (Format-Size (($ost | Measure-Object Bytes -Sum).Sum)))
+    }
+}
+
+if ($files.Count -eq 0) { Write-Bad 'Nothing to back up. Stopping.'; return }
+
+# --- sanitize verdicts, before dedupe so we do not hash what we will not keep
+Write-Step 'applying the sanitize rules ...'
+$shortcuts  = New-Object System.Collections.Generic.List[object]
+$quarantine = New-Object System.Collections.Generic.List[object]
+$macros     = New-Object System.Collections.Generic.List[object]
+$keepList   = New-Object System.Collections.Generic.List[object]
+$wshLnk     = $null
+try { $wshLnk = New-Object -ComObject WScript.Shell } catch { }
+
+foreach ($f in $files) {
+    $v = Get-SanitizeVerdict $f
+    $f.Verdict = $v[0]
+    $f.Reason  = $v[1]
+    $ext = [IO.Path]::GetExtension($f.Rel).ToLower()
+
+    if ($f.Verdict -eq 'LOG') {
+        if ($f.Reason -eq 'SHORTCUT' -and $wshLnk) {
+            $sc = $null
+            try { $sc = $wshLnk.CreateShortcut($f.Full) } catch { }
+            if ($sc) {
+                $shortcuts.Add([pscustomobject]@{
+                    Profile = $f.Profile; Rel = $f.Rel; Target = $sc.TargetPath
+                    Arguments = $sc.Arguments; WorkingDir = $sc.WorkingDirectory
+                })
+            }
+        }
+        $skipped.Add((New-Skip $f.Profile $f.Rel ('SANITIZE-' + $f.Reason) $f.Bytes))
+        continue
+    }
+    if ($f.Verdict -eq 'QUARANTINE') {
+        $quarantine.Add([pscustomobject]@{
+            Profile = $f.Profile; Rel = $f.Rel; Reason = $f.Reason
+            Bytes = $f.Bytes; Threat = ''; Source = 'sanitize-rule'
+        })
+    }
+    if ($MacroDoc -contains $ext) {
+        $macros.Add([pscustomobject]@{ Profile = $f.Profile; Rel = $f.Rel; Bytes = $f.Bytes })
+    }
+    $f.Tier = Get-Tier $ext $f.Bytes
+    $keepList.Add($f)
+}
+$files = $keepList
+
+$qCount = @($files | Where-Object { $_.Verdict -eq 'QUARANTINE' }).Count
+Write-Ok ("{0:N0} file(s) to copy, {1:N0} of them quarantined, {2:N0} shortcut(s) recorded" -f $files.Count, $qCount, $shortcuts.Count)
+
+# --- the estimate ----------------------------------------------------------
+Write-Sub ('ENUMERATION  ({0} profile(s), {1})' -f $chosen.Count, $swAll.Elapsed.ToString('hh\:mm\:ss'))
+Write-Host ('  profile                       files      to copy       junk    cloud-only') -ForegroundColor DarkGray
+Write-Host ('  -------------------------------------------------------------------------') -ForegroundColor DarkGray
+foreach ($p in $chosen) {
+    $mine  = @($files   | Where-Object { $_.Profile -eq $p.Name })
+    $sk    = @($skipped | Where-Object { $_.Profile -eq $p.Name })
+    $bytes = ($mine | Measure-Object Bytes -Sum).Sum
+    $junk  = (@($sk | Where-Object { $_.Reason -like 'JUNK*' -or $_.Reason -like '*EXCLUDED' }) | Measure-Object Bytes -Sum).Sum
+    $cloud = @($sk | Where-Object { $_.Reason -eq 'CLOUD-PLACEHOLDER' })
+    $cb    = ($cloud | Measure-Object Bytes -Sum).Sum
+    Write-Host ("  {0,-24} {1,8:N0} {2,12} {3,10} {4,8:N0} ({5})" -f `
+        $p.Name, $mine.Count, (Format-Size $bytes), (Format-Size $junk), $cloud.Count, (Format-Size $cb))
+}
+$totalBytes = ($files | Measure-Object Bytes -Sum).Sum
+if (-not $totalBytes) { $totalBytes = 0 }
+Write-Host ('  -------------------------------------------------------------------------') -ForegroundColor DarkGray
+Write-Host ("  {0,-24} {1,8:N0} {2,12}" -f 'TOTAL', $files.Count, (Format-Size $totalBytes)) -ForegroundColor White
+
+$placeholders = @($skipped | Where-Object { $_.Reason -eq 'CLOUD-PLACEHOLDER' })
+if ($placeholders.Count -gt 0) {
+    $pb = ($placeholders | Measure-Object Bytes -Sum).Sum
+    Write-Host ''
+    Write-Warn ("{0:N0} file(s), {1}, exist ONLY in OneDrive - not on this disk." -f $placeholders.Count, (Format-Size $pb))
+    Write-Warn 'They are listed in placeholders.csv and they are NOT being copied.'
+    Write-Warn 'Before you format: open OneDrive and choose "Always keep on this'
+    Write-Warn 'device", or make sure someone still has the account password.'
+}
+$denied = @($skipped | Where-Object { $_.Reason -eq 'DENIED' })
+if ($denied.Count -gt 0) { Write-Warn ("{0} folder(s) refused to open even as Administrator." -f $denied.Count) }
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 4  -  DEDUPE
+# ---------------------------------------------------------------------------
+Write-Sub 'DUPLICATES'
+$dupes = New-Object System.Collections.Generic.List[object]
+$files = Invoke-Dedupe $files $dupes
+$dupBytes = ($dupes | Measure-Object Bytes -Sum).Sum
+if (-not $dupBytes) { $dupBytes = 0 }
+$totalBytes = ($files | Measure-Object Bytes -Sum).Sum
+if (-not $totalBytes) { $totalBytes = 0 }
+if ($dupes.Count -gt 0) {
+    Write-Ok ("{0:N0} exact copy/copies dropped, {1} saved. Each one is logged in duplicates.csv" -f $dupes.Count, (Format-Size $dupBytes))
+    # A quarantined file can itself be an exact copy of another one, and then
+    # it never reaches _quarantine\. Drop it from the list too, so
+    # quarantine.csv and the folder always agree.
+    $stillHere = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($f in $files) {
+        if ($f.Verdict -eq 'QUARANTINE') { [void]$stillHere.Add(('{0}\{1}' -f $f.Profile, $f.Rel)) }
+    }
+    $qKeep = New-Object System.Collections.Generic.List[object]
+    foreach ($q in $quarantine) {
+        if ($stillHere.Contains(('{0}\{1}' -f $q.Profile, $q.Rel))) { $qKeep.Add($q) }
+    }
+    $quarantine = $qKeep
+    $qCount = $quarantine.Count
+}
+Write-Host ("  after dedupe: {0:N0} file(s), {1}" -f $files.Count, (Format-Size $totalBytes)) -ForegroundColor White
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 5  -  WHERE IT GOES
+# ---------------------------------------------------------------------------
+#  C: is not offered: backing C: up onto C: before formatting C: is theatre.
+#  Type it in by hand under "P" if you really mean it.
+$need = [long]($totalBytes * 1.02)
+$destRoot = ''
+$penRootDrive = ''
+
+if ($env:KD_BACKUP_DEST) {
+    $destRoot = $env:KD_BACKUP_DEST
+    Write-Step "using KD_BACKUP_DEST = $destRoot"
+}
+
+while (-not $destRoot) {
+    Write-Sub ('DESTINATION  -  it needs {0}' -f (Format-Size $need))
+    $cands = @(Get-WritableVolumes | Where-Object { $_.Letter -ne 'C:' -and $_.Letter -ne ($srcUsersRoot.Substring(0,2)) })
+    if ($cands.Count -gt 0) { Show-Volumes $cands $need }
+    else { Write-Warn 'There is no other partition on this PC.' }
+    Write-Host ''
+    Write-Host '   P.  Type any other writable path (external drive, mapped drive, share)'
+    Write-Host '   S.  Shrink C: to make a rescue partition   (last resort - read the warning)'
+    Write-Host '   0.  Cancel'
+    Write-Dim 'Borrowing any external drive or a second pen beats shrinking C:.'
+    $pick = (Read-Host '  Choice').Trim()
+
+    if ($pick -eq '0') { Write-Warn 'Cancelled. Nothing was written.'; return }
+    elseif ($pick -match '^[Pp]$') {
+        $typed = (Read-Host '  Path').Trim().Trim('"')
+        if (-not $typed) { continue }
+        if (-not (Test-Path -LiteralPath $typed)) {
+            try { New-Item -ItemType Directory -Force -Path $typed | Out-Null } catch { Write-Bad "Cannot create $typed"; continue }
+        }
+        if (-not (Test-Writable $typed)) { Write-Bad "Cannot write to $typed"; continue }
+        $destRoot = $typed
+    }
+    elseif ($pick -match '^[Ss]$') {
+        $r = Invoke-ShrinkForRescue $need $false $srcUsersRoot
+        if ($r) { $destRoot = $r }
+        # any guard that failed already explained itself; back to the menu
+    }
+    elseif ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $cands.Count) {
+        $v = $cands[[int]$pick - 1]
+        if ($v.Free -lt $need) {
+            Write-Warn ("{0} has only {1} free and the backup needs {2}." -f $v.Letter, (Format-Size $v.Free), (Format-Size $need))
+            if (-not (Confirm-Action 'Use it anyway and let it fill up?')) { continue }
+        }
+        if (-not (Test-Writable "$($v.Letter)\")) { Write-Bad "Cannot write to $($v.Letter)"; continue }
+        $destRoot = "$($v.Letter)\"
+    }
+    else { Write-Warn 'Not a choice on the list.' }
+}
+
+# --- the second copy, on a pen --------------------------------------------
+Write-Sub 'SECOND COPY  -  the USB pen'
+Write-Dim 'This is the copy that survives a full-disk format. Skipping it is a risk.'
+$pen = $null
+$penCands = @(Get-WritableVolumes | Where-Object {
+    $_.Letter -ne 'C:' -and "$($_.Letter)\" -ne $destRoot -and ($_.Kind -eq 'removable' -or $_.Size -lt 512GB)
+})
+if ($penCands.Count -eq 0) {
+    Write-Warn 'No removable drive found. Plug one in and it will be offered, or press Enter to skip.'
+    if (Confirm-Default 'Rescan for a pen now?' $true) { $penCands = @(Get-WritableVolumes | Where-Object { $_.Kind -eq 'removable' }) }
+}
+if ($penCands.Count -gt 0) {
+    Show-Volumes $penCands $need
+    Write-Host ''
+    Write-Host '   n.  No second copy'
+    $pp = (Read-Host '  Choice').Trim()
+    if ($pp -match '^\d+$' -and [int]$pp -ge 1 -and [int]$pp -le $penCands.Count) {
+        $pen = $penCands[[int]$pp - 1]
+        if (Test-Path -LiteralPath (Join-Path "$($pen.Letter)\" 'network-tools')) {
+            Write-Warn 'That is the KUDADONBE tools pen. Filling it with user data risks'
+            Write-Warn 'the tools you need for the rebuild.'
+            if (-not (Confirm-Action 'Use it anyway?')) { $pen = $null }
+        }
+    }
+}
+if ($pen) {
+    $worms = @(Test-ShortcutWorm "$($pen.Letter)\")
+    if ($worms.Count -gt 0) {
+        Write-Bad ("This pen already looks infected - {0} worm-style shortcut(s):" -f $worms.Count)
+        foreach ($w in $worms) { Write-Dim ("{0}  ->  {1} {2}" -f $w.Lnk, $w.Target, $w.Args) }
+        if (-not (Confirm-Action 'Use it anyway?')) { $pen = $null }
+    }
+}
+if (-not $pen) { Write-Warn 'No second copy. The backup will exist in exactly one place.' }
+
+# The source may itself be a stick that carried the infection in.
+$srcDrive = $srcUsersRoot.Substring(0, 3)
+$srcVol = @(Get-WritableVolumes | Where-Object { "$($_.Letter)\" -eq $srcDrive -and $_.Kind -eq 'removable' })
+if ($srcVol.Count -gt 0) {
+    $sw2 = @(Test-ShortcutWorm $srcDrive)
+    if ($sw2.Count -gt 0) {
+        Write-Bad 'The SOURCE drive shows the classic USB worm pattern: your folders'
+        Write-Bad 'were hidden and replaced with shortcuts that run something first.'
+        Write-Warn 'The real folders are being copied and un-hidden. The shortcuts are not.'
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 6  -  THE PLAN, AND ONE TYPED YES
+# ---------------------------------------------------------------------------
+$stamp      = Get-Date -Format 'yyyyMMdd_HHmm'
+$folderName = "{0}_{1}" -f $pcName, $stamp
+if ($dryRun) { $folderName = "$folderName-DRYRUN" }
+$backupRoot = Join-Path (Join-Path $destRoot 'KD-Backup') $folderName
+$penRoot    = ''
+if ($pen) { $penRoot = Join-Path (Join-Path "$($pen.Letter)\" 'KD-Backup') $folderName }
+
+$defenderAlive = Test-DefenderAlive
+
+Write-Sub 'THE PLAN'
+Write-Host ("  from        : {0}" -f $srcUsersRoot)
+Write-Host ("  profiles    : {0}" -f (($chosen | Select-Object -Expand Name) -join ', '))
+Write-Host ("  files       : {0:N0}   ({1})" -f $files.Count, (Format-Size $totalBytes))
+Write-Host ("  to          : {0}" -f $backupRoot)
+$penLine = '(none - one copy only)'
+if ($penRoot) { $penLine = $penRoot }
+Write-Host ("  second copy : {0}" -f $penLine)
+$avLine = 'DEFENDER IS NOT AVAILABLE - the sanitize rules are the only defence'
+if ($defenderAlive) { $avLine = 'Defender is alive - it will scan the finished backup' }
+Write-Host ("  virus       : {0}" -f $avLine)
+if ($dryRun) { Write-Host '  DRY RUN     : the lists will be written, the data will NOT be copied' -ForegroundColor Yellow }
+Write-Host ''
+if ((Read-Host '  Type YES to start') -ne 'YES') { Write-Warn 'Cancelled. Nothing was written.'; return }
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 7  -  COPY
+# ---------------------------------------------------------------------------
+New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+$unreadable = New-Object System.Collections.Generic.List[object]
+$copied = 0
+$copiedBytes = 0
+$failed = 0
+
+Write-Sub 'COPYING'
+if ($dryRun) {
+    Write-Warn 'Dry run: writing the lists only.'
+} else {
+    $tick = New-Ticker
+    foreach ($f in $files) {
+        $rel = Join-Path $f.Profile $f.Rel
+        if ($f.Verdict -eq 'QUARANTINE') {
+            $dst = Join-Path (Join-Path $backupRoot '_quarantine') ($rel + '.blocked')
+        } else {
+            $dst = Join-Path (Join-Path $backupRoot 'users') $rel
+        }
+        $r = Copy-OneFile $f.Full $dst $f.MTime
+        if ($r -eq 'OK') {
+            $copied++
+            $copiedBytes += $f.Bytes
+        } else {
+            $failed++
+            Write-Host ("  [FAIL] {0}\{1}" -f $f.Profile, $f.Rel) -ForegroundColor Red
+            Write-Dim $r
+            $unreadable.Add([pscustomobject]@{ Profile = $f.Profile; Rel = $f.Rel; Bytes = $f.Bytes; Error = $r })
+        }
+        if (Test-Tick $tick) {
+            $pct = 0
+            if ($totalBytes -gt 0) { $pct = [math]::Round(100 * $copiedBytes / $totalBytes) }
+            $mbs = 0
+            if ($tick.Sw.Elapsed.TotalSeconds -gt 0) { $mbs = [math]::Round(($copiedBytes / 1MB) / $tick.Sw.Elapsed.TotalSeconds, 1) }
+            $eta = '--:--:--'
+            if ($mbs -gt 0) { $eta = [TimeSpan]::FromSeconds((($totalBytes - $copiedBytes) / 1MB) / $mbs).ToString('hh\:mm\:ss') }
+            Write-Step ("{0:N0}/{1:N0} files  {2}/{3}  {4}%  {5} MB/s  eta {6}" -f `
+                $copied, $files.Count, (Format-Size $copiedBytes), (Format-Size $totalBytes), $pct, $mbs, $eta)
+        }
+    }
+
+    # The subtrees the walker would not descend, handed to robocopy whole.
+    # /XJ is its own reparse-loop guard. These are NOT deduped and NOT
+    # sanitize-filtered, and skipped.csv says so.
+    $longs = @($skipped | Where-Object { $_.Reason -eq 'PATH-TOO-LONG' })
+    foreach ($l in $longs) {
+        $srcDir = Join-Path (Join-Path $srcUsersRoot $l.Profile) $l.Rel
+        $dstDir = Join-Path (Join-Path (Join-Path $backupRoot 'users') $l.Profile) $l.Rel
+        Write-Step "long path - bulk copy of $($l.Rel)"
+        $null = & robocopy.exe $srcDir $dstDir /E /COPY:DAT /R:1 /W:1 /XJ /NP /NFL /NDL /NJH /NJS 2>&1
+        $l.Reason = 'LONG-PATH-BULK-COPY'
+    }
+
+    Write-Ok ("{0:N0} file(s) copied, {1}" -f $copied, (Format-Size $copiedBytes))
+    if ($failed -gt 0) { Write-Bad ("{0} file(s) could NOT be read - see unreadable.csv" -f $failed) }
+}
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 8  -  REBUILD EXTRAS
+# ---------------------------------------------------------------------------
+if ($withExtras -and -not $dryRun) {
+    Write-Sub 'REBUILD EXTRAS'
+    Save-Extras (Join-Path $backupRoot 'extras') $isLive
+}
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 9  -  THE MANIFESTS
+# ---------------------------------------------------------------------------
+#  These stay INSIDE the backup folder. They are a list of the user's file
+#  names, which is personal data - they must never be filed under reports\ on
+#  the pen, because sync-pen-reports pushes that whole folder to the server.
+Write-Sub 'WRITING THE LISTS'
+function Save-Csv($rows, $path, $label) {
+    # Count with Measure-Object, NOT @($rows).Count: wrapping a
+    # System.Collections.Generic.List in the array subexpression throws
+    # "Argument types do not match" on Windows PowerShell 5.1, and half of
+    # these lists are exactly that.
+    $n = ($rows | Measure-Object).Count
+    if ($n -eq 0) { return }
+    try {
+        $rows | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
+        Write-Ok ("{0}  ({1:N0} row(s))" -f $label, $n)
+    } catch { Write-Warn "$label failed: $($_.Exception.Message)" }
+}
+
+$manifest = foreach ($f in $files) {
+    [pscustomobject]@{
+        Profile   = $f.Profile
+        Rel       = $f.Rel
+        Bytes     = $f.Bytes
+        SHA256    = $f.Hash
+        LastWrite = $f.MTime
+        Tier      = $f.Tier
+        Verdict   = $f.Verdict
+        Reason    = $f.Reason
+        PenCopied = $false
+    }
+}
+Save-Csv $manifest     (Join-Path $backupRoot 'manifest.csv')     'manifest.csv'
+Save-Csv $dupes        (Join-Path $backupRoot 'duplicates.csv')   'duplicates.csv'
+Save-Csv $skipped      (Join-Path $backupRoot 'skipped.csv')      'skipped.csv'
+Save-Csv $placeholders (Join-Path $backupRoot 'placeholders.csv') 'placeholders.csv'
+Save-Csv $shortcuts    (Join-Path $backupRoot 'shortcuts.csv')    'shortcuts.csv'
+Save-Csv $macros       (Join-Path $backupRoot 'macro-files.csv')  'macro-files.csv'
+Save-Csv $unreadable   (Join-Path $backupRoot 'unreadable.csv')   'unreadable.csv'
+
+Save-RestoreReadme $backupRoot ([pscustomobject]@{
+    PcName = $pcName
+    When   = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+    Source = $srcUsersRoot
+})
+
+# The invariant that makes dedupe safe: every duplicate that was dropped must
+# name a file that IS in the manifest. Checked, and printed, every run.
+$dupOrphans = 0
+if ($dupes.Count -gt 0) {
+    $kept = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($m in $manifest) { [void]$kept.Add(('{0}\{1}' -f $m.Profile, $m.Rel)) }
+    foreach ($d in $dupes) { if (-not $kept.Contains($d.Kept)) { $dupOrphans++ } }
+    if ($dupOrphans -eq 0) { Write-Ok 'self-check: every dropped duplicate points at a file that IS in the backup.' }
+    else { Write-Bad ("self-check FAILED: {0} duplicate row(s) point at a file that is not here." -f $dupOrphans) }
+}
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 10  -  VIRUS
+# ---------------------------------------------------------------------------
+Write-Sub 'VIRUS CHECK'
+$scanLines = @()
+if ($dryRun) {
+    Write-Warn 'Dry run - no scan.'
+} elseif (-not $defenderAlive) {
+    Write-Bad 'Windows Defender is not available on this machine.'
+    Write-Warn 'That is the normal state of a PC that is about to be formatted, and'
+    Write-Warn 'it is why the sanitize rules run on every backup:'
+    Write-Warn ("  - {0} file(s) were quarantined by rule, not by a scanner" -f $qCount)
+    Write-Warn ("  - {0} shortcut(s) were recorded but not copied" -f $shortcuts.Count)
+    Write-Warn ("  - {0} macro document(s) were copied and flagged" -f $macros.Count)
+    Write-Host ''
+    Write-Warn 'SCAN THIS BACKUP BEFORE YOU RESTORE IT. On a healthy PC, run the'
+    Write-Warn 'backup-restore tool and pick "check a backup" - it updates Defender'
+    Write-Warn 'and scans the whole folder before it puts anything back.'
+    $scanLines = @(
+        'Defender was NOT available when this backup was taken.',
+        'Only the sanitize rules were applied. This backup has NOT been scanned.',
+        'Scan it with backup-restore on a healthy PC before restoring.'
+    )
+} else {
+    if (-not $isLive) { Write-Ok 'Scanning with this healthy PC''s Defender, not the sick machine''s.' }
+    $scan = Invoke-DefenderScan $backupRoot
+    $scanLines = @(
+        ("Scanned  : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm')),
+        ("On PC    : {0}" -f $env:COMPUTERNAME),
+        ("Sigs     : {0}" -f $scan.Signatures),
+        ("Ran      : {0}" -f $scan.Ran),
+        ("Threats  : {0}" -f @($scan.Threats).Count)
+    )
+    if ($scan.Note) { $scanLines += ("Note     : {0}" -f $scan.Note) }
+
+    if (@($scan.Threats).Count -eq 0) {
+        Write-Ok 'Defender found nothing in the backup.'
+    } else {
+        Write-Host ''
+        Write-Bad ("Defender found {0} threat(s) in the backup." -f @($scan.Threats).Count)
+        foreach ($t in $scan.Threats) {
+            Write-Dim ("{0}   {1}" -f $t.ThreatName, ($t.Resources -join '; '))
+            $scanLines += ("THREAT   : {0}  {1}" -f $t.ThreatName, ($t.Resources -join '; '))
+        }
+        Write-Host ''
+        Write-Warn 'Nothing was deleted - Defender was told not to touch them.'
+        if (Confirm-Default 'Move them into _quarantine\ inside the backup?' $true) {
+            $usersDir = Join-Path $backupRoot 'users'
+            foreach ($t in $scan.Threats) {
+                foreach ($res in @($t.Resources)) {
+                    $p = $res -replace '^file:_', ''
+                    if (-not (Test-Path -LiteralPath $p)) { continue }
+                    if (-not $p.StartsWith($usersDir, 'OrdinalIgnoreCase')) { continue }
+                    $rel = $p.Substring($usersDir.Length + 1)
+                    $dst = Join-Path (Join-Path $backupRoot '_quarantine') ($rel + '.blocked')
+                    try {
+                        $dd = Split-Path $dst -Parent
+                        if (-not (Test-Path -LiteralPath $dd)) { New-Item -ItemType Directory -Force -Path $dd | Out-Null }
+                        Move-Item -LiteralPath $p -Destination $dst -Force -ErrorAction Stop
+                        $quarantine.Add([pscustomobject]@{
+                            Profile = ($rel -split '\\')[0]
+                            Rel     = ($rel -split '\\', 2)[1]
+                            Reason  = 'defender-detection'
+                            Bytes   = 0
+                            Threat  = $t.ThreatName
+                            Source  = 'defender'
+                        })
+                        # keep it off the pen as well
+                        foreach ($f in $files) {
+                            if ((Join-Path $f.Profile $f.Rel) -ieq $rel) { $f.Verdict = 'QUARANTINE' }
+                        }
+                        Write-Ok "quarantined $rel"
+                    } catch { Write-Warn "could not move $rel : $($_.Exception.Message)" }
+                }
+            }
+            $scanLines += 'Detections were MOVED to _quarantine\ (nothing deleted).'
+        }
+    }
+}
+Set-Content -LiteralPath (Join-Path $backupRoot 'scan.txt') -Value $scanLines -Encoding UTF8
+Save-Csv $quarantine (Join-Path $backupRoot 'quarantine.csv') 'quarantine.csv'
+
+
+# ---------------------------------------------------------------------------
+#  STAGE 11  -  THE PEN, FILLED BY PRIORITY
+# ---------------------------------------------------------------------------
+$notFit = New-Object System.Collections.Generic.List[object]
+$penCopied = 0
+$penBytes = 0
+if ($penRoot -and -not $dryRun) {
+    Write-Sub 'SECOND COPY  -  filling the pen by priority'
+    New-Item -ItemType Directory -Force -Path $penRoot | Out-Null
+
+    $vol = Get-Volume -DriveLetter $pen.Letter.TrimEnd(':') -ErrorAction SilentlyContinue
+    $fatLimit = [long]::MaxValue
+    if ($vol -and $vol.FileSystem -eq 'FAT32') {
+        $fatLimit = 4GB - 1MB
+        Write-Warn 'The pen is FAT32: no single file over 4 GB can be written to it.'
+    }
+    $budget = ($pen.Free) - 256MB      # headroom, so the pen stays mountable
+
+    # Tier 0 first and unconditionally: the lists, the README and extras\ are
+    # tiny, and they are the map to everything else.
+    Write-Step 'tier 0: the lists, the README and extras ...'
+    foreach ($item in (Get-ChildItem -LiteralPath $backupRoot -File -ErrorAction SilentlyContinue)) {
+        $r = Copy-OneFile $item.FullName (Join-Path $penRoot $item.Name) $item.LastWriteTime
+        if ($r -eq 'OK') { $budget -= $item.Length }
+    }
+    $exDir = Join-Path $backupRoot 'extras'
+    if (Test-Path -LiteralPath $exDir) {
+        $null = & robocopy.exe $exDir (Join-Path $penRoot 'extras') /E /COPY:DAT /R:1 /W:1 /XJ /NP /NFL /NDL /NJH /NJS 2>&1
+    }
+
+    # Then 1, 2, 3, 4. Small files first inside a tier: it rescues the most
+    # documents, and it lets the greedy pass backfill the gap an oversized file
+    # leaves behind. Quarantined files never go on the pen.
+    $penFiles = @($files | Where-Object { $_.Verdict -eq 'COPY' } | Sort-Object Tier, Bytes)
+    $tick = New-Ticker
+    foreach ($f in $penFiles) {
+        if ($f.Bytes -ge $fatLimit) {
+            $notFit.Add([pscustomobject]@{ Profile=$f.Profile; Rel=$f.Rel; Bytes=$f.Bytes; Tier=$f.Tier; Reason='FAT32-OVER-4GB' })
+            continue
+        }
+        if ($f.Bytes -gt $budget) {
+            # continue, NOT break - one big file must not block the thousands
+            # of small ones queued behind it.
+            $notFit.Add([pscustomobject]@{ Profile=$f.Profile; Rel=$f.Rel; Bytes=$f.Bytes; Tier=$f.Tier; Reason='NO-SPACE' })
+            continue
+        }
+        $src = Join-Path (Join-Path (Join-Path $backupRoot 'users') $f.Profile) $f.Rel
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        $r = Copy-OneFile $src (Join-Path (Join-Path $penRoot 'users') (Join-Path $f.Profile $f.Rel)) $f.MTime
+        if ($r -eq 'OK') {
+            $budget -= $f.Bytes
+            $penCopied++
+            $penBytes += $f.Bytes
+            $f.OnPen = $true
+        }
+        if (Test-Tick $tick) {
+            Write-Step ("pen: {0:N0} file(s), {1} written, {2} free left" -f $penCopied, (Format-Size $penBytes), (Format-Size $budget))
+        }
+    }
+
+    $penManifest = foreach ($f in $penFiles) {
+        if (-not $f.OnPen) { continue }
+        [pscustomobject]@{ Profile = $f.Profile; Rel = $f.Rel; Bytes = $f.Bytes; Tier = $f.Tier }
+    }
+    Save-Csv $penManifest (Join-Path $penRoot 'pen-manifest.csv') 'pen-manifest.csv'
+    Save-Csv $notFit      (Join-Path $penRoot 'not-on-pen.csv')   'not-on-pen.csv'
+    Save-Csv $notFit      (Join-Path $backupRoot 'not-on-pen.csv') 'not-on-pen.csv (backup copy)'
+
+    Write-Ok ("pen: {0:N0} file(s), {1}" -f $penCopied, (Format-Size $penBytes))
+    if ($notFit.Count -gt 0) {
+        $nb = ($notFit | Measure-Object Bytes -Sum).Sum
+        Write-Warn ("{0:N0} file(s), {1}, did not fit on the pen." -f $notFit.Count, (Format-Size $nb))
+        Write-Warn 'They exist only in the main copy. See not-on-pen.csv.'
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+#  DONE
+# ---------------------------------------------------------------------------
+Write-Head 'DONE'
+Write-Host ("  from        : {0}   ({1})" -f $srcUsersRoot, $pcName)
+Write-Host ("  copied      : {0:N0} file(s), {1}" -f $copied, (Format-Size $copiedBytes))
+Write-Host ("  main copy   : {0}" -f $backupRoot)
+if ($penRoot) { Write-Host ("  pen copy    : {0}  ({1:N0} file(s), {2})" -f $penRoot, $penCopied, (Format-Size $penBytes)) }
+if ($dupes.Count -gt 0)      { Write-Host ("  duplicates  : {0:N0} dropped, {1} saved (all logged)" -f $dupes.Count, (Format-Size $dupBytes)) }
+if ($quarantine.Count -gt 0) { Write-Host ("  quarantined : {0:N0} (in _quarantine\, nothing deleted)" -f $quarantine.Count) }
+if ($failed -gt 0)           { Write-Host ("  unreadable  : {0:N0}  - see unreadable.csv" -f $failed) -ForegroundColor Red }
+if ($placeholders.Count -gt 0) { Write-Host ("  cloud-only  : {0:N0}  - still in OneDrive only" -f $placeholders.Count) -ForegroundColor Yellow }
+
+Write-Sub 'BEFORE YOU FORMAT'
+if (-not $penRoot) {
+    Write-Bad 'There is only ONE copy of this data.'
+    if ($destRoot -match '^[A-Za-z]:\\$' -and $destRoot -notmatch '^[Cc]') {
+        Write-Warn 'If it is a partition of the same physical disk as C:, a full-disk'
+        Write-Warn 'format destroys it too. Copy it somewhere else first.'
+    }
+} else {
+    Write-Ok 'Two copies exist. The pen copy survives a full-disk format.'
+}
+if ($placeholders.Count -gt 0) {
+    Write-Warn 'OneDrive cloud-only files were NOT copied - make sure someone still'
+    Write-Warn 'has that account, or hydrate them before wiping the disk.'
+}
+if (-not $defenderAlive -and -not $dryRun) {
+    Write-Warn 'This backup has not been virus-scanned. Run backup-restore on a'
+    Write-Warn 'healthy PC and pick "check a backup" before restoring any of it.'
+}
+Write-Host ''
+Write-Dim 'Open the backup folder and read README-RESTORE.txt - it explains every'
+Write-Dim 'list in there and how to put the data back by hand if you have to.'
+Write-Host ''

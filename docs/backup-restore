@@ -1,0 +1,495 @@
+# =============================================================================
+#  backup-restore.ps1  -  check a backup, then put it back
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  The other half of the backup tool. It runs days later, on the REBUILT PC,
+#  or on any healthy machine holding the backup:
+#    1. finds a KD-Backup folder on any drive, or takes a path you type
+#    2. verifies it against manifest.csv - every file present, the right size,
+#       and the right SHA-256 where one was recorded
+#    3. scans it with Windows Defender, signatures updated first. This is the
+#       step the sick PC could not do for itself.
+#    4. restores a profile into the new one WITHOUT overwriting anything: a
+#       collision is renamed, never replaced
+#    5. can mark the restored Office documents as "from the internet", so they
+#       open in Protected View and a macro cannot fire on a double-click
+#
+#  HOW TO RUN
+#  ----------
+#  From the pen or share menu, pick "backup-restore". Or directly:
+#     iex (gc <path>\backup-restore.txt -Raw)
+#
+#  It is INTERACTIVE and takes no parameters (they cannot be passed through
+#  iex, which is how the menu launches every tool).
+#
+#  WHAT IT SAVES
+#  -------------
+#    <backup>\verify-<date>.csv    what did not match the manifest
+#    <backup>\scan-<date>.txt      what Defender found
+#    <backup>\restore-log.csv      what was put back, and where
+#
+#  SAFETY
+#  ------
+#  It never deletes and never overwrites. A file already sitting in the target
+#  folder is left alone and the restored copy lands beside it with the date in
+#  its name. Threats are MOVED into _quarantine\, never removed.
+#
+#  It will not certify a backup as clean on a machine whose Defender is dead -
+#  it says so and stops, rather than giving you a false all-clear.
+# =============================================================================
+
+$ErrorActionPreference = 'Stop'
+
+function Write-Head($text) {
+    Write-Host ''
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+}
+function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
+function Confirm-Action($prompt) { (Read-Host "  $prompt (y/n)") -match '^[Yy]' }
+function Confirm-Default($prompt, $default) {
+    $hint = 'y/N'
+    if ($default) { $hint = 'Y/n' }
+    $a = (Read-Host "  $prompt ($hint)").Trim()
+    if (-not $a) { return $default }
+    return ($a -match '^[Yy]')
+}
+function Format-Size($bytes) {
+    if (-not $bytes) { return '0 B' }
+    if ($bytes -ge 1TB) { return ('{0:N1} TB' -f ($bytes / 1TB)) }
+    if ($bytes -ge 1GB) { return ('{0:N1} GB' -f ($bytes / 1GB)) }
+    if ($bytes -ge 1MB) { return ('{0:N1} MB' -f ($bytes / 1MB)) }
+    if ($bytes -ge 1KB) { return ('{0:N0} KB' -f ($bytes / 1KB)) }
+    return ('{0:N0} B' -f $bytes)
+}
+
+$Sha = [System.Security.Cryptography.SHA256]::Create()
+function Get-Sha256Fast([string]$Path) {
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        return [BitConverter]::ToString($Sha.ComputeHash($fs)).Replace('-', '')
+    } catch { return $null } finally { if ($fs) { $fs.Dispose() } }
+}
+
+# Same four-signal test the backup tool uses: the cmdlet, the service, the AM
+# service flag and the engine's own answer all fail differently.
+function Test-DefenderAlive {
+    $st = $null
+    try { $st = Get-MpComputerStatus -ErrorAction Stop } catch { return $false }
+    if (-not $st) { return $false }
+    $svc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+    if (-not $svc -or $svc.Status -ne 'Running') { return $false }
+    if (-not $st.AMServiceEnabled) { return $false }
+    if (-not $st.AntivirusEnabled) { return $false }
+    return $true
+}
+
+function Get-MpCmdRun {
+    $plat = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Platform'
+    if (Test-Path $plat) {
+        $newest = Get-ChildItem $plat -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+        if ($newest) {
+            $p = Join-Path $newest.FullName 'MpCmdRun.exe'
+            if (Test-Path $p) { return $p }
+        }
+    }
+    $p = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+    if (Test-Path $p) { return $p }
+    return $null
+}
+
+
+# ---------------------------------------------------------------------------
+#  FIND A BACKUP
+# ---------------------------------------------------------------------------
+function Find-Backups {
+    $found = @()
+    foreach ($dt in 2, 3) {
+        foreach ($d in (Get-CimInstance Win32_LogicalDisk -Filter "DriveType=$dt" -ErrorAction SilentlyContinue)) {
+            $root = Join-Path "$($d.DeviceID)\" 'KD-Backup'
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            foreach ($b in (Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+                if (Test-Path -LiteralPath (Join-Path $b.FullName 'manifest.csv')) { $found += $b }
+            }
+        }
+    }
+    return $found | Sort-Object LastWriteTime -Descending
+}
+
+
+# ---------------------------------------------------------------------------
+#  VERIFY
+# ---------------------------------------------------------------------------
+#  Everything that was hashed during dedupe is checked properly and for free.
+#  The rest is checked on size, plus a 2% random sample hashed in full - which
+#  is enough to catch a pen that went bad, and cheap enough that nobody skips
+#  the step.
+function Invoke-Verify([string]$Root) {
+    $manifest = @(Import-Csv (Join-Path $Root 'manifest.csv'))
+    $usersDir = Join-Path $Root 'users'
+    $bad = New-Object System.Collections.Generic.List[object]
+    $checked = 0; $hashed = 0; $missing = 0; $wrongSize = 0; $wrongHash = 0
+
+    $rng = New-Object System.Random 12345   # fixed seed: the same 2% every run
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $tick = 0.0
+
+    foreach ($m in $manifest) {
+        # Quarantined files were moved and renamed on purpose; not a fault.
+        if ($m.Verdict -eq 'QUARANTINE') { continue }
+        $p = Join-Path (Join-Path $usersDir $m.Profile) $m.Rel
+        $checked++
+
+        if (-not (Test-Path -LiteralPath $p)) {
+            $missing++
+            $bad.Add([pscustomobject]@{ Profile=$m.Profile; Rel=$m.Rel; Problem='MISSING'; Expected=$m.Bytes; Actual='' })
+            continue
+        }
+        $fi = Get-Item -LiteralPath $p -Force
+        if ([long]$fi.Length -ne [long]$m.Bytes) {
+            $wrongSize++
+            $bad.Add([pscustomobject]@{ Profile=$m.Profile; Rel=$m.Rel; Problem='WRONG-SIZE'; Expected=$m.Bytes; Actual=$fi.Length })
+            continue
+        }
+        $doHash = $false
+        if ($m.SHA256) { $doHash = $true }
+        elseif ($rng.NextDouble() -lt 0.02) { $doHash = $true }
+
+        if ($doHash) {
+            $h = Get-Sha256Fast $p
+            $hashed++
+            if (-not $h) {
+                $bad.Add([pscustomobject]@{ Profile=$m.Profile; Rel=$m.Rel; Problem='UNREADABLE'; Expected=$m.SHA256; Actual='' })
+            } elseif ($m.SHA256 -and $h -ne $m.SHA256) {
+                $wrongHash++
+                $bad.Add([pscustomobject]@{ Profile=$m.Profile; Rel=$m.Rel; Problem='WRONG-HASH'; Expected=$m.SHA256; Actual=$h })
+            }
+        }
+        if ($sw.Elapsed.TotalSeconds - $tick -ge 3) {
+            $tick = $sw.Elapsed.TotalSeconds
+            Write-Step ("checked {0:N0}/{1:N0}, {2:N0} hashed" -f $checked, $manifest.Count, $hashed)
+        }
+    }
+
+    Write-Host ''
+    Write-Host ("  files in the manifest : {0:N0}" -f $manifest.Count)
+    Write-Host ("  checked               : {0:N0}   ({1:N0} hashed in full)" -f $checked, $hashed)
+    if ($missing)   { Write-Bad ("missing    : {0:N0}" -f $missing) }
+    if ($wrongSize) { Write-Bad ("wrong size : {0:N0}" -f $wrongSize) }
+    if ($wrongHash) { Write-Bad ("wrong hash : {0:N0}  - this backup is damaged" -f $wrongHash) }
+    if ($bad.Count -eq 0) { Write-Ok 'every file checked matches the manifest.' }
+
+    if ($bad.Count -gt 0) {
+        $out = Join-Path $Root ("verify-{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmm'))
+        try { $bad | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8; Write-Warn "details: $out" }
+        catch { Write-Warn "could not write the verify report: $($_.Exception.Message)" }
+    }
+    return ($bad.Count -eq 0)
+}
+
+
+# ---------------------------------------------------------------------------
+#  SCAN
+# ---------------------------------------------------------------------------
+function Invoke-Scan([string]$Root) {
+    if (-not (Test-DefenderAlive)) {
+        Write-Bad 'Windows Defender is not working on THIS machine.'
+        Write-Warn 'There is no point pretending otherwise: without it, this tool cannot'
+        Write-Warn 'tell you the backup is clean. Move the backup to a healthy PC and'
+        Write-Warn 'run this there before you restore anything.'
+        return $false
+    }
+
+    Write-Step 'updating Defender signatures ...'
+    $sigs = ''
+    try {
+        Update-MpSignature -ErrorAction Stop
+        $sigs = (Get-MpComputerStatus).AntivirusSignatureVersion
+        Write-Ok "signatures now $sigs"
+    } catch {
+        $st = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        if ($st) { $sigs = $st.AntivirusSignatureVersion }
+        Write-Warn "could not update signatures: $($_.Exception.Message)"
+        if (-not (Confirm-Default 'Scan with the signatures already on this PC?' $true)) { return $false }
+    }
+
+    $start = Get-Date
+    $mp = Get-MpCmdRun
+    Write-Step 'scanning - this takes a while on a big backup ...'
+    try {
+        if ($mp) {
+            # -DisableRemediation is not negotiable: this may be the only copy
+            # of the data left in the world.
+            & $mp -Scan -ScanType 3 -File $Root -DisableRemediation 2>&1 | ForEach-Object {
+                if ($_ -match 'found|Threat|threat') { Write-Dim $_ }
+            }
+        } else {
+            Start-MpScan -ScanType CustomScan -ScanPath $Root -ErrorAction Stop
+        }
+    } catch { Write-Bad "scan failed: $($_.Exception.Message)"; return $false }
+
+    $hits = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object { $_.InitialDetectionTime -ge $start })
+    $lines = @(
+        ("Scanned : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm')),
+        ("On PC   : {0}" -f $env:COMPUTERNAME),
+        ("Sigs    : {0}" -f $sigs),
+        ("Threats : {0}" -f $hits.Count)
+    )
+
+    if ($hits.Count -eq 0) {
+        Write-Ok 'Defender found nothing in this backup.'
+    } else {
+        Write-Host ''
+        Write-Bad ("{0} threat(s) found. Nothing was deleted." -f $hits.Count)
+        foreach ($t in $hits) {
+            Write-Dim ("{0}   {1}" -f $t.ThreatName, ($t.Resources -join '; '))
+            $lines += ("THREAT  : {0}  {1}" -f $t.ThreatName, ($t.Resources -join '; '))
+        }
+        $usersDir = Join-Path $Root 'users'
+        if (Confirm-Default 'Move them into _quarantine\ inside the backup?' $true) {
+            foreach ($t in $hits) {
+                foreach ($res in @($t.Resources)) {
+                    $p = $res -replace '^file:_', ''
+                    if (-not (Test-Path -LiteralPath $p)) { continue }
+                    if (-not $p.StartsWith($usersDir, 'OrdinalIgnoreCase')) { continue }
+                    $rel = $p.Substring($usersDir.Length + 1)
+                    $dst = Join-Path (Join-Path $Root '_quarantine') ($rel + '.blocked')
+                    try {
+                        $dd = Split-Path $dst -Parent
+                        if (-not (Test-Path -LiteralPath $dd)) { New-Item -ItemType Directory -Force -Path $dd | Out-Null }
+                        Move-Item -LiteralPath $p -Destination $dst -Force -ErrorAction Stop
+                        Write-Ok "quarantined $rel"
+                    } catch { Write-Warn "could not move $rel : $($_.Exception.Message)" }
+                }
+            }
+            $lines += 'Detections were MOVED to _quarantine\ (nothing deleted).'
+        }
+    }
+
+    $out = Join-Path $Root ("scan-{0}.txt" -f (Get-Date -Format 'yyyyMMdd_HHmm'))
+    try { Set-Content -LiteralPath $out -Value $lines -Encoding UTF8; Write-Dim "saved: $out" } catch { }
+    return ($hits.Count -eq 0)
+}
+
+
+# ---------------------------------------------------------------------------
+#  RESTORE
+# ---------------------------------------------------------------------------
+#  Mark of the Web. Writing ZoneId=3 makes Office open the file in Protected
+#  View, so a macro cannot fire on a double-click. It costs nothing and it is
+#  the only cheap defence left when the backup was taken from a PC whose
+#  Defender was dead.
+function Set-MarkOfTheWeb([string]$Path) {
+    try {
+        Set-Content -LiteralPath ($Path + ':Zone.Identifier') -Encoding ASCII -Value @(
+            '[ZoneTransfer]', 'ZoneId=3'
+        ) -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+function Invoke-Restore([string]$Root) {
+    $usersDir = Join-Path $Root 'users'
+    if (-not (Test-Path -LiteralPath $usersDir)) { Write-Bad 'This backup has no users\ folder.'; return }
+
+    $profiles = @(Get-ChildItem -LiteralPath $usersDir -Directory -ErrorAction SilentlyContinue)
+    if ($profiles.Count -eq 0) { Write-Bad 'No profiles in this backup.'; return }
+
+    Write-Sub 'WHICH PROFILE'
+    for ($i = 0; $i -lt $profiles.Count; $i++) {
+        $sz = (Get-ChildItem -LiteralPath $profiles[$i].FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
+               Measure-Object Length -Sum).Sum
+        Write-Host ("  {0,2}.  {1,-28}  {2}" -f ($i + 1), $profiles[$i].Name, (Format-Size $sz))
+    }
+    $pick = (Read-Host '  Choice').Trim()
+    if ($pick -notmatch '^\d+$' -or [int]$pick -lt 1 -or [int]$pick -gt $profiles.Count) { Write-Warn 'Cancelled.'; return }
+    $src = $profiles[[int]$pick - 1]
+
+    Write-Sub 'WHAT TO PUT BACK'
+    Write-Host '  1.  Documents, Desktop and Pictures only   (the usual choice)'
+    Write-Host '  2.  Everything in the profile'
+    Write-Host '  3.  Just open the folder and let me drag it myself'
+    Write-Host '  0.  Back'
+    $what = (Read-Host '  Choice').Trim()
+    if ($what -eq '0' -or -not $what) { return }
+    if ($what -eq '3') { Start-Process explorer.exe $src.FullName; return }
+
+    $target = (Read-Host "  Restore into (Enter = $env:USERPROFILE)").Trim().Trim('"')
+    if (-not $target) { $target = $env:USERPROFILE }
+    if (-not (Test-Path -LiteralPath $target)) { Write-Bad "$target does not exist."; return }
+
+    $folders = @('Documents', 'Desktop', 'Pictures')
+    if ($what -eq '2') {
+        $folders = @(Get-ChildItem -LiteralPath $src.FullName -Directory -ErrorAction SilentlyContinue | Select-Object -Expand Name)
+    }
+
+    $motw = Confirm-Default 'Mark restored Office documents as "from the internet" (Protected View)?' $true
+
+    Write-Host ''
+    Write-Host ("  from : {0}" -f $src.FullName)
+    Write-Host ("  to   : {0}" -f $target)
+    Write-Host ("  what : {0}" -f ($folders -join ', '))
+    Write-Dim 'Nothing already in the target is overwritten - a clash is renamed.'
+    Write-Host ''
+    if ((Read-Host '  Type YES to restore') -ne 'YES') { Write-Warn 'Cancelled.'; return }
+
+    $log = New-Object System.Collections.Generic.List[object]
+    $office = @('.doc','.docx','.docm','.xls','.xlsx','.xlsm','.ppt','.pptx','.pptm','.pdf','.rtf')
+    $datestamp = Get-Date -Format 'yyyy-MM-dd'
+    $done = 0; $renamed = 0; $failed = 0
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $tick = 0.0
+
+    foreach ($folder in $folders) {
+        $sf = Join-Path $src.FullName $folder
+        if (-not (Test-Path -LiteralPath $sf)) { continue }
+        Write-Step "restoring $folder ..."
+        $items = @(Get-ChildItem -LiteralPath $sf -Recurse -File -Force -ErrorAction SilentlyContinue)
+        foreach ($it in $items) {
+            $rel = $it.FullName.Substring($src.FullName.Length + 1)
+            $dst = Join-Path $target $rel
+            $action = 'restored'
+            if (Test-Path -LiteralPath $dst) {
+                $dir  = Split-Path $dst -Parent
+                $base = [IO.Path]::GetFileNameWithoutExtension($dst)
+                $ext  = [IO.Path]::GetExtension($dst)
+                $dst  = Join-Path $dir ("{0} (restored {1}){2}" -f $base, $datestamp, $ext)
+                $action = 'renamed - the target already had one'
+                $renamed++
+            }
+            try {
+                $dd = Split-Path $dst -Parent
+                if (-not [System.IO.Directory]::Exists($dd)) { [System.IO.Directory]::CreateDirectory($dd) | Out-Null }
+                [System.IO.File]::Copy($it.FullName, $dst, $false)
+                [System.IO.File]::SetLastWriteTime($dst, $it.LastWriteTime)
+                if ($motw -and ($office -contains $it.Extension.ToLower())) { $null = Set-MarkOfTheWeb $dst }
+                $done++
+            } catch {
+                $action = "FAILED: $($_.Exception.Message)"
+                $failed++
+                Write-Host ("  [FAIL] {0}" -f $rel) -ForegroundColor Red
+            }
+            $log.Add([pscustomobject]@{ Rel = $rel; To = $dst; Action = $action; Bytes = $it.Length })
+            if ($sw.Elapsed.TotalSeconds - $tick -ge 3) {
+                $tick = $sw.Elapsed.TotalSeconds
+                Write-Step ("{0:N0} file(s) restored ..." -f $done)
+            }
+        }
+    }
+
+    Write-Host ''
+    Write-Ok ("{0:N0} file(s) restored into {1}" -f $done, $target)
+    if ($renamed -gt 0) { Write-Warn ("{0:N0} had a name that was already taken - those were renamed, not replaced." -f $renamed) }
+    if ($failed -gt 0)  { Write-Bad ("{0:N0} failed - see restore-log.csv" -f $failed) }
+    try {
+        $out = Join-Path $Root 'restore-log.csv'
+        $log | Export-Csv -LiteralPath $out -NoTypeInformation -Encoding UTF8
+        Write-Dim "log: $out"
+    } catch { Write-Warn "could not write the restore log: $($_.Exception.Message)" }
+
+    $dupCsv = Join-Path $Root 'duplicates.csv'
+    if (Test-Path -LiteralPath $dupCsv) {
+        Write-Host ''
+        Write-Dim 'Reminder: exact duplicates were stored once. duplicates.csv lists every'
+        Write-Dim 'copy that was dropped and names the file that was kept instead.'
+    }
+}
+
+
+# ===========================================================================
+#  MAIN
+# ===========================================================================
+Write-Head 'BACKUP-RESTORE  -  check a backup, then put it back'
+
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Warn 'Not running as Administrator. Verifying and scanning still work;'
+    Write-Warn 'restoring into another user''s profile will not.'
+}
+
+Write-Step 'looking for backups on every drive ...'
+$backups = @(Find-Backups)
+$root = ''
+if ($backups.Count -gt 0) {
+    Write-Sub 'BACKUPS FOUND'
+    for ($i = 0; $i -lt $backups.Count; $i++) {
+        $b = $backups[$i]
+        $n = @(Import-Csv (Join-Path $b.FullName 'manifest.csv')).Count
+        Write-Host ("  {0,2}.  {1,-34}  {2:N0} file(s)   {3}" -f `
+            ($i + 1), $b.Name, $n, $b.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
+        Write-Dim $b.FullName
+    }
+    Write-Host ''
+    Write-Host '   P.  Type a path instead'
+    Write-Host '   0.  Exit'
+    $pick = (Read-Host '  Choice').Trim()
+    if ($pick -eq '0') { return }
+    if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $backups.Count) {
+        $root = $backups[[int]$pick - 1].FullName
+    }
+} else {
+    Write-Warn 'No KD-Backup folder found on any drive.'
+}
+if (-not $root) {
+    $root = (Read-Host '  Path to the backup folder').Trim().Trim('"')
+}
+if (-not $root -or -not (Test-Path -LiteralPath $root)) { Write-Bad 'Not a folder. Stopping.'; return }
+if (-not (Test-Path -LiteralPath (Join-Path $root 'manifest.csv'))) {
+    Write-Bad 'There is no manifest.csv in there - that is not a backup this tool made.'
+    return
+}
+Write-Ok "using $root"
+
+$scanTxt = @(Get-ChildItem -LiteralPath $root -Filter 'scan*.txt' -ErrorAction SilentlyContinue)
+if ($scanTxt.Count -gt 0) {
+    Write-Sub 'WHAT THE BACKUP SAYS ABOUT ITSELF'
+    Get-Content -LiteralPath $scanTxt[0].FullName | ForEach-Object { Write-Dim $_ }
+}
+
+$verified = $false
+$scanned  = $false
+
+while ($true) {
+    Write-Sub 'WHAT NOW'
+    Write-Host '  1.  Verify it against the manifest   (nothing is changed)'
+    Write-Host '  2.  Virus-scan it with Defender      (needed before restoring)'
+    Write-Host '  3.  Restore a profile'
+    Write-Host '  4.  Open the backup folder'
+    Write-Host '  0.  Exit'
+    $c = (Read-Host '  Choice').Trim()
+
+    if ($c -eq '0' -or -not $c) { break }
+    elseif ($c -eq '1') { Write-Sub 'VERIFY'; $verified = Invoke-Verify $root }
+    elseif ($c -eq '2') { Write-Sub 'VIRUS SCAN'; $scanned = Invoke-Scan $root }
+    elseif ($c -eq '3') {
+        if (-not $scanned) {
+            Write-Warn 'This backup has not been scanned in this session.'
+            Write-Warn 'It came off a PC that was being formatted - assume it is infected'
+            Write-Warn 'until a working Defender says otherwise.'
+            if (-not (Confirm-Action 'Restore anyway?')) { continue }
+        }
+        if (-not $verified) { Write-Dim 'Tip: option 1 first proves the files are all there and undamaged.' }
+        Invoke-Restore $root
+    }
+    elseif ($c -eq '4') { Start-Process explorer.exe $root }
+    else { Write-Warn 'Not a choice on the list.' }
+}
+
+Write-Host ''
+Write-Dim 'README-RESTORE.txt in the backup folder explains every list in there.'
+Write-Host ''
