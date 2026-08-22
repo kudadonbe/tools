@@ -226,6 +226,82 @@ function Get-PrimaryUser {
     return 'unknown'
 }
 
+function Write-KdToolLog([string]$Tool, [string]$Message) {
+    # One line of usage telemetry per event: when, which PC, who, which tool,
+    # what happened - so tool behaviour in the field can be reviewed and
+    # improved (owner's request, 2026-08-20). Appends to
+    # <share>\reports\tool-usage\<yyyy-MM>.log, or to the pen's
+    # reports\tool-usage\ when the share is unreachable (sync-pen-reports
+    # carries the pen's reports up later). Logging must NEVER break a tool:
+    # every failure here is silent, and the function returns nothing.
+    $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
+        $env:COMPUTERNAME, $env:USERNAME, $Tool, ($Message -replace '[\r\n\t]+', ' ')
+    $rel = Join-Path 'reports\tool-usage' ("{0}.log" -f (Get-Date -Format 'yyyy-MM'))
+    $targets = @()
+    if ($Site -and $Site.ShareBase) { $targets += Join-Path $Site.ShareBase $rel }
+    if ($Site -and $Site.PenMarker) {
+        foreach ($dt in 2, 3) {
+            foreach ($d in Get-CimInstance Win32_LogicalDisk -Filter "DriveType=$dt" -ErrorAction SilentlyContinue) {
+                $m = Join-Path "$($d.DeviceID)\" $Site.PenMarker
+                if (Test-Path $m -ErrorAction SilentlyContinue) { $targets += Join-Path $m $rel }
+            }
+        }
+    }
+    foreach ($t in $targets) {
+        try {
+            $dir = Split-Path $t
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+            Add-Content -Path $t -Value $line -Encoding UTF8 -ErrorAction Stop
+            return    # the first destination that takes the line is enough
+        } catch { }
+    }
+}
+
+function Start-KdTranscript([string]$Tool) {
+    # Begin a FULL console transcript of a tool run (everything the tool
+    # printed - the automated version of saving the console output by hand,
+    # which is how the fonts tool's field failures were debugged). Recorded
+    # locally first so a mid-run share hiccup cannot break the tool;
+    # Complete-KdTranscript ships it afterwards. Returns the local path, or
+    # $null when the transcript could not start (never an error).
+    try {
+        $dir = Join-Path $env:TEMP 'kd-transcripts'
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $p = Join-Path $dir ("{0}_{1}_{2}.txt" -f $Tool, $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        Start-Transcript -Path $p -ErrorAction Stop | Out-Null
+        return $p
+    } catch { return $null }
+}
+
+function Complete-KdTranscript([string]$Path) {
+    # Stop the transcript and ship it to <share>\reports\transcripts\, or the
+    # pen's reports\transcripts\ when off-LAN (sync-pen-reports carries those
+    # up later). No destination at all (public build, no pen): the local file
+    # is deleted rather than left behind. Silent on every failure.
+    if (-not $Path) { return }
+    try { Stop-Transcript | Out-Null } catch { }
+    if (-not (Test-Path $Path)) { return }
+    $dirs = @()
+    if ($Site -and $Site.ShareBase) { $dirs += Join-Path $Site.ShareBase 'reports\transcripts' }
+    if ($Site -and $Site.PenMarker) {
+        foreach ($dt in 2, 3) {
+            foreach ($d in Get-CimInstance Win32_LogicalDisk -Filter "DriveType=$dt" -ErrorAction SilentlyContinue) {
+                $m = Join-Path "$($d.DeviceID)\" $Site.PenMarker
+                if (Test-Path $m -ErrorAction SilentlyContinue) { $dirs += Join-Path $m 'reports\transcripts' }
+            }
+        }
+    }
+    foreach ($d in $dirs) {
+        try {
+            if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+            Copy-Item $Path (Join-Path $d (Split-Path $Path -Leaf)) -Force -ErrorAction Stop
+            Remove-Item $Path -Force -ErrorAction SilentlyContinue
+            return
+        } catch { }
+    }
+    Remove-Item $Path -Force -ErrorAction SilentlyContinue
+}
+
 function Invoke-KdTool([string]$Name) {
     # Fetch a sibling tool's TEXT and run it in this session - never as a
     # script file, so it works under any execution policy (the same trick the

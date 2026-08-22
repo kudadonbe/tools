@@ -1,5 +1,5 @@
 # =============================================================================
-#  run.ps1  -  KUDADONBE Network Tools launcher
+#  pc-check.ps1  -  60-second triage: why is this PC slow / is this PC ready?
 # =============================================================================
 #
 #  AUTHOR
@@ -9,30 +9,29 @@
 #
 #  WHAT IT DOES
 #  ------------
-#  Shows a numbered menu of the tools and runs whichever one you pick, so you
-#  remember ONE line instead of each tool's own. Two modes, from one file:
-#    - on a managed LAN (ShareBase set): reads each tool as .txt off the share.
-#    - public (no ShareBase): fetches each tool from the public hub over https.
-#  The public menu lists only the tools flagged Public.
+#  The two questions this answers, read-only, in about a minute:
 #
-#     irm <host>/<launcher> | iex
+#    "This PC is slow"        -> disk health + space, memory pressure, uptime,
+#                                Defender state, pending reboot, startup load,
+#                                recent system errors - ending in a VERDICT,
+#                                and an offer to run cleanup when that is the
+#                                likely fix.
+#    "Is this new PC ready?"  -> on an office PC (WebApps configured) it also
+#                                tests that every office web system is
+#                                reachable. On a personal PC that section
+#                                simply does not exist - same tool for both.
 #
-#  After a tool finishes it returns to the menu, so you can run several tools
-#  in one session. Pick 0 (or just press Enter) to quit.
-#
-#  ADDING A TOOL
-#  -------------
-#  Add one line to the $tools list below (Name, Public, Desc). Internal fetch
-#  is <ShareBase>\<Name>.txt; public fetch is <PublicBase>/<Name>.
+#  Read-only: nothing is changed unless you accept the cleanup offer at the
+#  end. Works without admin (a couple of checks read deeper with it).
 # =============================================================================
 
 $ErrorActionPreference = 'SilentlyContinue'
 
 # <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
 $Site = @{
-    ShareBase  = ''
-    PublicBase = 'https://kudadonbe.github.io/tools'
-    PenMarker  = 'network-tools'
+    ShareBase = ''
+    PenMarker = 'network-tools'
+    WebApps   = @()
 }
 # <#/SITE#>
 
@@ -344,141 +343,133 @@ function Update-PcReport([string]$PcName) {
 }
 # <#/FUNCTIONS#>
 
-# ShareBase present -> internal (read .txt off the share). Empty -> public
-# (fetch each tool from the hub over https).
-$public = -not $Site.ShareBase
+function Write-Head($t) { Write-Host ''; Write-Host "== $t ==" -ForegroundColor Cyan }
+function Write-Ok($t)   { Write-Host "  OK   $t" -ForegroundColor Green }
+function Write-Warn($t) { Write-Host "  !    $t" -ForegroundColor Yellow }
+function Write-Bad($t)  { Write-Host "  X    $t" -ForegroundColor Red }
+function Write-Dim($t)  { Write-Host "       $t" -ForegroundColor DarkGray }
 
-# --- Tool catalogue --------------------------------------------------------
-#  Name = tool + menu label, Desc = one-line description, Show = where it is
-#  listed: 'both', 'internal', or 'public'. The individual printer-* tools are
-#  'public' - internally the 'printer' hub covers them, so they are not repeated
-#  in the office menu. Fetch target is derived from the mode.
-$tools = @(
-    [pscustomobject]@{ Name = 'newpc';           Show = 'internal'; Desc = 'Set up a new PC (admin)' }
-    [pscustomobject]@{ Name = 'rename-pc';       Show = 'internal'; Desc = 'PC name protocol + asset number (admin)' }
-    [pscustomobject]@{ Name = 'asset';           Show = 'both';     Desc = 'Record asset numbers for this desk (PC, monitor, ...) (admin)' }
-    [pscustomobject]@{ Name = 'printer';         Show = 'internal'; Desc = 'Connect / share / remove printers + diagnostics' }
-    [pscustomobject]@{ Name = 'scan';            Show = 'internal'; Desc = 'Set up scanning (ScanGear/NAPS2 or scan-to-folder), by department (admin)' }
-    [pscustomobject]@{ Name = 'printer-info';    Show = 'public';   Desc = "Show a PC's printers, remotely" }
-    [pscustomobject]@{ Name = 'printer-diag';    Show = 'public';   Desc = 'Diagnose print sharing failures' }
-    [pscustomobject]@{ Name = 'printer-clear';   Show = 'public';   Desc = 'Clear stuck print jobs' }
-    [pscustomobject]@{ Name = 'printer-fleet';   Show = 'internal'; Desc = 'SNMP health sweep of all printers (toner, serials, counts)' }
-    [pscustomobject]@{ Name = 'backup';          Show = 'both';     Desc = 'Rescue user data before a format - deduped, virus-safe, 2nd copy on a pen (admin)' }
-    [pscustomobject]@{ Name = 'backup-restore';  Show = 'both';     Desc = 'Check a backup and put it back on the rebuilt PC (admin)' }
-    [pscustomobject]@{ Name = 'pc-check';        Show = 'both';     Desc = '60-second triage: slow PC / new-PC readiness (read-only)' }
-    [pscustomobject]@{ Name = 'cleanup';         Show = 'both';     Desc = 'Flush temp, reclaim C:, free memory/browsers (admin)' }
-    [pscustomobject]@{ Name = 'fonts';           Show = 'internal'; Desc = 'Install the Dhivehi/Arabic font packs for all users (admin)' }
-    [pscustomobject]@{ Name = 'mems';            Show = 'internal'; Desc = 'Set up MEMS: IE mode + trusted zone, permanent, all users (admin)' }
-    [pscustomobject]@{ Name = 'sysinfo';         Show = 'both';     Desc = 'PC inventory snapshot' }
-    [pscustomobject]@{ Name = 'gateway-monitor'; Show = 'both';     Desc = 'Connectivity diagnostic' }
-)
-# The menu for this context: 'both' plus the current tier's own entries.
-$tier = if ($public) { 'public' } else { 'internal' }
-$menu = @($tools | Where-Object { $_.Show -eq 'both' -or $_.Show -eq $tier })
+$issues = New-Object System.Collections.ArrayList   # what the verdict is built from
+function Add-Issue([string]$Severity, [string]$Text) { $null = $issues.Add([pscustomobject]@{ Sev = $Severity; Text = $Text }) }
 
+Write-Host ''
+Write-Host ('=' * 60) -ForegroundColor Cyan
+Write-Host "  PC-CHECK  -  $env:COMPUTERNAME  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
+Write-Host ('=' * 60) -ForegroundColor Cyan
 
-function Show-Menu {
-    Write-Host ''
-    Write-Host ('=' * 44) -ForegroundColor Cyan
-    Write-Host '  KUDADONBE Tools' -ForegroundColor Cyan
-    Write-Host ('=' * 44) -ForegroundColor Cyan
-    for ($i = 0; $i -lt $menu.Count; $i++) {
-        Write-Host ("  {0}.  {1,-18}{2}" -f ($i + 1), $menu[$i].Name, $menu[$i].Desc)
+# --- Uptime ------------------------------------------------------------------
+Write-Head 'UPTIME'
+$os = Get-CimInstance Win32_OperatingSystem
+$up = (Get-Date) - $os.LastBootUpTime
+if ($up.TotalDays -ge 7) {
+    Write-Warn ("up {0:N1} days - Windows degrades without a real restart" -f $up.TotalDays)
+    Add-Issue 'warn' "not restarted for $([int]$up.TotalDays) days - restart it"
+} else { Write-Ok ("up {0:N1} days (booted {1:yyyy-MM-dd HH:mm})" -f $up.TotalDays, $os.LastBootUpTime) }
+Write-Dim "$($os.Caption) build $($os.BuildNumber)"
+
+# --- Disk health + space -----------------------------------------------------
+Write-Head 'DISKS'
+foreach ($pd in Get-PhysicalDisk) {
+    $flag = if ($pd.HealthStatus -eq 'Healthy') { 'OK' } else { 'BAD' }
+    if ($flag -eq 'OK') { Write-Ok ("{0}  {1}  {2:N0} GB  health: {3}" -f $pd.FriendlyName, $pd.MediaType, ($pd.Size/1GB), $pd.HealthStatus) }
+    else {
+        Write-Bad ("{0}  health: {1} - BACK IT UP NOW (see the backup tool)" -f $pd.FriendlyName, $pd.HealthStatus)
+        Add-Issue 'bad' "disk '$($pd.FriendlyName)' reports $($pd.HealthStatus) - back up and replace"
     }
-    # On the public hub, offer to load the full office menu from a share the
-    # technician names at runtime. Nothing about the office is baked in here.
-    if ($public) { Write-Host '  O.  Office tools        (load the full menu from an office share)' -ForegroundColor DarkCyan }
-    Write-Host '  0.  exit'
-    Write-Host ('=' * 44) -ForegroundColor Cyan
+}
+foreach ($sm in Get-CimInstance -Namespace root\wmi MSStorageDriver_FailurePredictStatus) {
+    if ($sm.PredictFailure) {
+        Write-Bad 'SMART predicts imminent disk FAILURE'
+        Add-Issue 'bad' 'SMART failure predicted - back up and replace the disk'
+    }
+}
+foreach ($v in Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' }) {
+    $pct = if ($v.Size) { [math]::Round(100 * $v.SizeRemaining / $v.Size) } else { 0 }
+    $line = "{0}:  {1:N0} GB free of {2:N0} GB ({3}%)" -f $v.DriveLetter, ($v.SizeRemaining/1GB), ($v.Size/1GB), $pct
+    if ($v.DriveLetter -eq ($env:SystemDrive.Trim(':')) -and ($pct -lt 10 -or $v.SizeRemaining -lt 15GB)) {
+        Write-Warn $line
+        Add-Issue 'warn' "C: is nearly full ($pct% free) - run cleanup"
+    } else { Write-Ok $line }
 }
 
+# --- Memory ------------------------------------------------------------------
+Write-Head 'MEMORY'
+$totGB  = $os.TotalVisibleMemorySize / 1MB
+$freeGB = $os.FreePhysicalMemory / 1MB
+$usedPct = [math]::Round(100 * (1 - $os.FreePhysicalMemory / $os.TotalVisibleMemorySize))
+$line = "{0:N1} GB of {1:N1} GB in use ({2}%)" -f ($totGB - $freeGB), $totGB, $usedPct
+if ($usedPct -ge 85) { Write-Warn $line; Add-Issue 'warn' "memory pressure ($usedPct% used) - cleanup can free it, or the PC needs more RAM" }
+else { Write-Ok $line }
+if ($totGB -lt 7) { Write-Warn ("only {0:N0} GB RAM - below comfortable for current Windows + Office" -f $totGB); Add-Issue 'warn' "only $([math]::Round($totGB)) GB RAM - upgrade candidate" }
+Write-Dim 'top consumers:'
+Get-Process | Group-Object Name | ForEach-Object {
+    [pscustomobject]@{ Name = $_.Name; MB = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum / 1MB) }
+} | Sort-Object MB -Descending | Select-Object -First 5 | ForEach-Object { Write-Dim ("  {0,-24} {1,6:N0} MB" -f $_.Name, $_.MB) }
 
-# Load the INTERNAL launcher (kd.txt) from an office share the tech types in,
-# then hand control to it - it carries the office config and the full toolset.
-# The path is entered every time, so this public file leaks nothing.
-function Invoke-OfficeMenu {
-    Write-Host ''
-    $sp = (Read-Host '  Office share path (e.g. \\server\share\...\04_Network)').Trim()
-    if (-not $sp) { return }
-    $runTxt = Join-Path $sp 'kd.txt'
+# --- Defender ----------------------------------------------------------------
+Write-Head 'DEFENDER'
+$mp = Get-MpComputerStatus
+if ($mp) {
+    if ($mp.RealTimeProtectionEnabled) { Write-Ok 'real-time protection on' } else { Write-Bad 'real-time protection OFF'; Add-Issue 'bad' 'Defender real-time protection is off' }
+    $age = ((Get-Date) - $mp.AntivirusSignatureLastUpdated).Days
+    if ($age -gt 7) { Write-Warn "signatures $age days old"; Add-Issue 'warn' "Defender signatures $age days old - no recent updates?" }
+    else { Write-Ok "signatures $age day(s) old" }
+} else { Write-Warn 'could not query Defender (needs admin on some PCs)' }
 
-    $code = $null
-    try { $code = Get-Content -Path $runTxt -Raw -ErrorAction Stop }
-    catch {
-        Write-Host "  Could not read $runTxt" -ForegroundColor Yellow
-        $ans = Read-Host '  Sign in with a domain account and retry? (y/n)'
-        if ($ans -eq 'y') {
-            $cred = Get-Credential -Message 'Domain account with access to the office share'
-            if ($cred) {
-                try {
-                    New-PSDrive -Name KDOffice -PSProvider FileSystem -Root $sp -Credential $cred -ErrorAction Stop | Out-Null
-                    $code = Get-Content -Path $runTxt -Raw -ErrorAction Stop
-                }
-                catch { Write-Host "  Still no access: $($_.Exception.Message)" -ForegroundColor Red }
-                finally { Remove-PSDrive -Name KDOffice -Force -ErrorAction SilentlyContinue }
-            }
-        }
+# --- Pending reboot ----------------------------------------------------------
+Write-Head 'PENDING'
+$pend = @()
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'servicing (CBS)' }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'Windows Update' }
+if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager').PendingFileRenameOperations) { $pend += 'file renames' }
+if ($pend) { Write-Warn ("restart pending: " + ($pend -join ', ')); Add-Issue 'warn' 'a restart is pending - restart before judging performance' }
+else { Write-Ok 'no restart pending' }
+
+# --- Recent system errors ----------------------------------------------------
+Write-Head 'EVENT LOG (last 24h)'
+$errs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = (Get-Date).AddDays(-1) } -MaxEvents 200)
+if ($errs.Count -eq 0) { Write-Ok 'no critical/error events' }
+else {
+    Write-Warn ("{0} error/critical event(s); most frequent:" -f $errs.Count)
+    $errs | Group-Object ProviderName | Sort-Object Count -Descending | Select-Object -First 3 |
+        ForEach-Object { Write-Dim ("  {0,3}x  {1}" -f $_.Count, $_.Name) }
+    if ($errs.Count -ge 20) { Add-Issue 'warn' "$($errs.Count) system errors in 24h - see Event Viewer (top: $((@($errs | Group-Object ProviderName | Sort-Object Count -Descending)[0]).Name))" }
+    if ($errs | Where-Object { $_.ProviderName -match 'disk|ntfs|storahci|iaStor' }) {
+        Add-Issue 'bad' 'DISK errors in the event log - back up and test the disk'
     }
-    if ([string]::IsNullOrWhiteSpace($code)) {
-        Write-Host '  Tip: a brand-new PC has no network yet - use the setup pen for those.' -ForegroundColor DarkGray
-        return
-    }
-    & ([scriptblock]::Create($code))
 }
 
-
-# --- Main loop -------------------------------------------------------------
-while ($true) {
-    Show-Menu
-    $choice = Read-Host '  Select a tool'
-
-    # 0 or empty = quit
-    if ($choice -eq '0' -or [string]::IsNullOrWhiteSpace($choice)) {
-        Write-Host '  Done.' -ForegroundColor Green
-        break
+# --- Office web systems (office PCs only - blank list on personal PCs) -------
+if (@($Site.WebApps).Count -gt 0) {
+    Write-Head 'OFFICE WEB SYSTEMS'
+    $down = 0
+    foreach ($u in $Site.WebApps) {
+        $uri  = [Uri]$u
+        $port = if ($uri.Port -gt 0) { $uri.Port } elseif ($uri.Scheme -eq 'http') { 80 } else { 443 }
+        $tcp  = New-Object System.Net.Sockets.TcpClient
+        $sw   = [System.Diagnostics.Stopwatch]::StartNew()
+        $ok   = $false
+        try { $ok = $tcp.ConnectAsync($uri.Host, $port).Wait(2500) -and $tcp.Connected } catch { }
+        $tcp.Close()
+        if ($ok) { Write-Ok ("{0,-38} {1,4} ms" -f $uri.Host, $sw.ElapsedMilliseconds) }
+        else     { Write-Bad ("{0,-38} unreachable" -f $uri.Host); $down++ }
     }
+    if ($down) { Add-Issue 'bad' "$down office web system(s) unreachable - check network/DNS (gateway-monitor digs deeper)" }
+}
 
-    # Public hub only: 'O' loads the full office menu from a named share.
-    if ($public -and $choice -match '^[Oo]$') { Invoke-OfficeMenu; continue }
-
-    # Validate the choice is a number within range
-    $index = 0
-    if (-not [int]::TryParse($choice, [ref]$index) -or $index -lt 1 -or $index -gt $menu.Count) {
-        Write-Host "  Invalid choice: '$choice'" -ForegroundColor Yellow
-        continue
+# --- Verdict -----------------------------------------------------------------
+Write-Head 'VERDICT'
+if ($issues.Count -eq 0) {
+    Write-Ok 'nothing wrong found. If it still feels slow, the next suspects are'
+    Write-Dim 'browser tab load and Office add-ins - things this check cannot weigh.'
+} else {
+    foreach ($i in ($issues | Sort-Object { if ($_.Sev -eq 'bad') { 0 } else { 1 } })) {
+        if ($i.Sev -eq 'bad') { Write-Bad $i.Text } else { Write-Warn $i.Text }
     }
+}
+Write-KdToolLog 'pc-check' ("verdict: " + $(if ($issues.Count) { ($issues | ForEach-Object { $_.Text }) -join ' | ' } else { 'clean' }))
 
-    $tool = $menu[$index - 1]
-
-    Write-Host ''
-    Write-Host "  Launching $($tool.Name)..." -ForegroundColor Cyan
-    Write-Host ''
-
-    # Fetch the tool's text and run it. [scriptblock]::Create + & runs it with
-    # its own param() defaults intact. Internal: Get-Content off the share (the
-    # reliable way to read a UNC path on Windows PowerShell 5.1). Public: irm
-    # over https (which works on both 5.1 and 7 for a real URL).
-    # Every launch is logged (start, finish + duration, or the error) - the
-    # menu is the one door every tool goes through, so logging here covers the
-    # whole kit without touching each tool.
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    Write-KdToolLog 'kd' "launch $($tool.Name)"
-    $ts = Start-KdTranscript $tool.Name
-    try {
-        if ($public) {
-            $code = Invoke-RestMethod -Uri "$($Site.PublicBase)/$($tool.Name)" -ErrorAction Stop
-        } else {
-            $code = Get-Content -Path (Join-Path $Site.ShareBase "$($tool.Name).txt") -Raw -ErrorAction Stop
-        }
-        if ([string]::IsNullOrWhiteSpace($code)) { throw 'tool is empty' }
-        & ([scriptblock]::Create($code))
-        Write-KdToolLog 'kd' ("finished {0} ({1:N0}s)" -f $tool.Name, $sw.Elapsed.TotalSeconds)
-    } catch {
-        Write-Host "  Failed to run $($tool.Name): $($_.Exception.Message)" -ForegroundColor Red
-        Write-KdToolLog 'kd' ("FAILED {0} after {1:N0}s: {2}" -f $tool.Name, $sw.Elapsed.TotalSeconds, $_.Exception.Message)
-    }
-    Complete-KdTranscript $ts
-
-    Write-Host ''
-    Write-Host '  --- tool finished, returning to menu ---' -ForegroundColor DarkGray
+# The most common fixes are one tool away - offer it when relevant.
+if ($issues | Where-Object { $_.Text -match 'cleanup|nearly full|memory pressure' }) {
+    if ((Read-Host '  Run the cleanup tool now? (y/n)') -match '^[Yy]') { Invoke-KdTool 'cleanup' }
 }

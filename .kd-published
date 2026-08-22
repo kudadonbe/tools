@@ -1,8 +1,10 @@
 asset
 backup
 backup-restore
+cleanup
 gateway-monitor
 kd
+pc-check
 printer-clear
 printer-diag
 printer-info

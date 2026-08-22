@@ -1,0 +1,366 @@
+# =============================================================================
+#  cleanup.ps1  -  Reclaim temp / disk / memory on a shared office PC
+# =============================================================================
+#
+#  AUTHOR
+#  ------
+#  KUDADONBE (KD)  -  Computer Consultancy
+#  kudadonbe@outlook.com
+#
+#  WHAT IT DOES
+#  ------------
+#  A desk tool for the machines many people share. One menu:
+#    1. Flush temp & caches   - every user profile's Temp + browser caches
+#    2. Reclaim C: drive      - finds the big space users (restore-point
+#                               "snapshots", Windows Update cache, recycle bin,
+#                               Dell data) and clears the safe ones; the
+#                               rollback-losing ones are offered separately
+#    3. Free memory           - top RAM consumers, end the ones you pick
+#    4. Close browsers        - warns the logged-on user, then closes gracefully
+#    5. Do all                - 1 + the safe part of 2 + 4
+#  It shows C: free space before and after, and files a transcript report.
+#
+#  HOW TO RUN
+#  ----------
+#  From the menu, pick "cleanup" (needs an ADMIN window). Or directly:
+#     irm <host>/cleanup | iex
+#  Interactive - it prompts and confirms; it takes no parameters (they cannot
+#  pass through iex). Every destructive step asks first.
+#
+#  LIMITS
+#  ------
+#  Deletes ONLY inside known temp / cache / recycle locations - never user
+#  documents or a profile root. Files in use are skipped. "Deep" disk actions
+#  (delete restore points, DISM component cleanup) remove your rollback safety
+#  net and are gated behind an extra warning.
+# =============================================================================
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
+$Site = @{
+    ShareBase = ''
+    ItUsers   = @()
+}
+# <#/SITE#>
+
+function Write-Head($text) {
+    Write-Host ''
+    Write-Host ('=' * 60) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 60) -ForegroundColor Cyan
+}
+function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+
+function Confirm-Action($prompt) { (Read-Host "  $prompt (y/n)") -match '^[Yy]' }
+
+function Get-CFreeGB { [math]::Round((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'").FreeSpace / 1GB, 2) }
+
+# Bytes on disk under a path (files only, best-effort, silent on denied).
+function Get-PathBytes($path) {
+    if (-not (Test-Path $path)) { return 0 }
+    (Get-ChildItem $path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+}
+function Format-MB($bytes) { if (-not $bytes) { '0 MB' } else { '{0:N0} MB' -f ($bytes / 1MB) } }
+
+# Delete the CONTENTS of a directory (never the directory itself), files in use
+# are skipped. Returns the count of items it attempted to remove.
+function Clear-DirContents($dir) {
+    if (-not (Test-Path $dir)) { return 0 }
+    $items = @(Get-ChildItem $dir -Force -ErrorAction SilentlyContinue)
+    foreach ($i in $items) { Remove-Item $i.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    $items.Count
+}
+
+# -------------------------------------------------------------------------
+#  Admin gate - the whole point (other profiles' Temp, Windows\Temp, VSS,
+#  DISM, killing other users' processes) needs elevation.
+# -------------------------------------------------------------------------
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+Write-Head 'CLEANUP  -  reclaim temp / disk / memory'
+if (-not $isAdmin) {
+    Write-Bad 'This must be run as Administrator.'
+    Write-Warn 'Close this window and start the tool from an elevated PowerShell'
+    Write-Warn '(the pen launcher already runs as admin).'
+    return
+}
+
+# -------------------------------------------------------------------------
+#  Report log (transcript) - audit trail of everything deleted / killed.
+# -------------------------------------------------------------------------
+$reportDir = if ($Site.ShareBase) { Join-Path $Site.ShareBase 'reports\cleanup' } else { Join-Path $env:TEMP 'cleanup' }
+try { New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction Stop | Out-Null }
+catch { $reportDir = Join-Path $env:TEMP 'cleanup'; New-Item -ItemType Directory -Force -Path $reportDir -ErrorAction SilentlyContinue | Out-Null }
+$reportFile = Join-Path $reportDir ("cleanup_{0}_{1}.txt" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+try { Start-Transcript -Path $reportFile -Force -ErrorAction Stop | Out-Null } catch { $reportFile = $null }
+
+
+# =========================================================================
+#  1. FLUSH TEMP & CACHES  (all user profiles)
+# =========================================================================
+function Invoke-TempFlush {
+    Write-Sub 'FLUSH TEMP & CACHES  (all user profiles)'
+    $before = Get-CFreeGB
+
+    # Whitelisted locations only. Each is a directory whose CONTENTS we clear.
+    $targets = @()
+    $targets += 'C:\Windows\Temp'
+    foreach ($u in (Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
+        $la = Join-Path $u.FullName 'AppData\Local'
+        $targets += (Join-Path $la 'Temp')
+        # Chromium-family caches (Edge / Chrome / Brave). Locked parts are skipped.
+        foreach ($b in 'Microsoft\Edge', 'Google\Chrome', 'BraveSoftware\Brave-Browser') {
+            $ud = Join-Path $la "$b\User Data"
+            if (Test-Path $ud) {
+                foreach ($prof in (Get-ChildItem $ud -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })) {
+                    foreach ($c in 'Cache', 'Code Cache', 'GPUCache', 'Service Worker\CacheStorage') {
+                        $targets += (Join-Path $prof.FullName $c)
+                    }
+                }
+            }
+        }
+        # Explorer thumbnail / icon cache
+        $targets += (Join-Path $la 'Microsoft\Windows\Explorer')  # only thumbcache_* below
+    }
+
+    Write-Host ("  clearing {0} temp/cache location(s) ..." -f $targets.Count) -ForegroundColor DarkGray
+    if (-not (Confirm-Action 'Delete temp & cache files now?')) { Write-Warn 'Skipped.'; return }
+
+    $removed = 0
+    foreach ($t in ($targets | Select-Object -Unique)) {
+        if (-not (Test-Path $t)) { continue }
+        # Safety belt: only ever operate on a path that looks like temp/cache.
+        if ($t -notmatch '\\(Temp|Cache|Code Cache|GPUCache|CacheStorage|Explorer)$') { continue }
+        if ($t -like '*\Explorer') {
+            Get-ChildItem $t -Filter 'thumbcache_*' -File -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+            Get-ChildItem $t -Filter 'iconcache_*' -File -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+            continue
+        }
+        $removed += Clear-DirContents $t
+    }
+
+    $after = Get-CFreeGB
+    Write-Ok ("Temp/cache flushed. Items cleared: ~{0}.  C: free {1} GB -> {2} GB (+{3} GB)" -f `
+            $removed, $before, $after, [math]::Round($after - $before, 2))
+}
+
+
+# =========================================================================
+#  2. RECLAIM C: DRIVE  (detect big space users, act with confirmation)
+# =========================================================================
+function Invoke-DiskReclaim {
+    Write-Sub 'RECLAIM C: DRIVE'
+    Write-Host ("  C: free now: {0} GB" -f (Get-CFreeGB)) -ForegroundColor White
+
+    # ---- detect / report the big consumers -------------------------------
+    Write-Host ''
+    Write-Host '  Big space users on C: (report):' -ForegroundColor White
+    $wu  = Get-PathBytes 'C:\Windows\SoftwareDistribution\Download'
+    $doc = Get-PathBytes 'C:\Windows\SoftwareDistribution\DeliveryOptimization'
+    $rb  = Get-PathBytes 'C:\$Recycle.Bin'
+    $dell = 0; foreach ($p in 'C:\Dell', 'C:\ProgramData\Dell') { $dell += Get-PathBytes $p }
+    $winsxs = Get-PathBytes 'C:\Windows\WinSxS'
+    Write-Host ("    Windows Update cache   : {0}" -f (Format-MB $wu))
+    Write-Host ("    Delivery Optimization  : {0}" -f (Format-MB $doc))
+    Write-Host ("    Recycle Bin (all users): {0}" -f (Format-MB $rb))
+    Write-Host ("    Dell (SupportAssist)   : {0}" -f (Format-MB $dell))
+    Write-Host ("    WinSxS component store : {0}   (managed by DISM - never delete directly)" -f (Format-MB $winsxs)) -ForegroundColor DarkGray
+
+    # Restore-point "snapshots" (VSS shadow storage)
+    Write-Host ''
+    Write-Host '  Restore points / shadow storage (vssadmin):' -ForegroundColor White
+    (vssadmin list shadowstorage 2>&1) | Where-Object { $_ -match 'Used|Allocated|Maximum' } |
+        ForEach-Object { Write-Host "    $($_.Trim())" -ForegroundColor DarkGray }
+    $shadowCount = @(vssadmin list shadows 2>&1 | Select-String 'Shadow Copy ID').Count
+    Write-Host ("    restore points present : {0}" -f $shadowCount) -ForegroundColor DarkGray
+
+    # ---- SAFE actions (no data loss) -------------------------------------
+    Write-Host ''
+    Write-Host '  Safe cleanups (no rollback lost):' -ForegroundColor White
+    $before = Get-CFreeGB
+
+    if ($rb -gt 0 -and (Confirm-Action 'Empty the Recycle Bin (all users)?')) {
+        Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+        Write-Ok 'Recycle Bin emptied.'
+    }
+    if ($wu -gt 0 -and (Confirm-Action 'Clear the Windows Update download cache?')) {
+        Write-Step 'stopping wuauserv / bits ...'
+        Stop-Service wuauserv, bits -Force -ErrorAction SilentlyContinue
+        Clear-DirContents 'C:\Windows\SoftwareDistribution\Download' | Out-Null
+        Start-Service wuauserv, bits -ErrorAction SilentlyContinue
+        Write-Ok 'Windows Update cache cleared.'
+    }
+    if ($doc -gt 0 -and (Confirm-Action 'Clear the Delivery Optimization cache?')) {
+        if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
+            Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue
+        } else { Clear-DirContents 'C:\Windows\SoftwareDistribution\DeliveryOptimization' | Out-Null }
+        Write-Ok 'Delivery Optimization cache cleared.'
+    }
+
+    $after = Get-CFreeGB
+    Write-Ok ("Safe reclaim done.  C: free {0} GB -> {1} GB (+{2} GB)" -f $before, $after, [math]::Round($after - $before, 2))
+
+    # ---- DEEP actions (remove rollback) ----------------------------------
+    Write-Host ''
+    Write-Warn 'DEEP actions below REMOVE your rollback safety net. Use with care.'
+    if ($shadowCount -gt 0 -and (Confirm-Action "Delete ALL $shadowCount restore point(s)/snapshots? (no System Restore rollback after)")) {
+        if (Confirm-Action 'Are you sure? This cannot be undone') {
+            vssadmin delete shadows /all /quiet 2>&1 | Out-Null
+            Write-Ok 'Restore points deleted.'
+        }
+    }
+    if (Confirm-Action 'Run DISM component cleanup (WinSxS)? Slow; cannot uninstall superseded updates after') {
+        Write-Step 'DISM /Online /Cleanup-Image /StartComponentCleanup ... (this takes a while)'
+        & dism.exe /Online /Cleanup-Image /StartComponentCleanup | Out-Null
+        Write-Ok 'DISM component cleanup finished.'
+    }
+    Write-Host ("  C: free now: {0} GB" -f (Get-CFreeGB)) -ForegroundColor White
+    if ($dell -gt 0) { Write-Warn 'Dell SupportAssist recovery data was only reported, not touched - manage it via Dell''s own recovery settings.' }
+}
+
+
+# =========================================================================
+#  3. FREE MEMORY  (top consumers, selective end)
+# =========================================================================
+$CriticalProcs = @('System', 'Idle', 'Registry', 'csrss', 'wininit', 'winlogon',
+    'services', 'lsass', 'smss', 'dwm', 'fontdrvhost', 'explorer', 'powershell',
+    'pwsh', 'WindowsTerminal', 'conhost', 'MsMpEng')
+
+function Invoke-FreeMemory {
+    Write-Sub 'FREE MEMORY'
+    $os = Get-CimInstance Win32_OperatingSystem
+    $totalGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+    $freeGB  = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+    Write-Host ("  RAM: {0} GB total, {1} GB free ({2}% used)" -f $totalGB, $freeGB,
+        [math]::Round(100 * ($totalGB - $freeGB) / $totalGB)) -ForegroundColor White
+    Write-Host '  (PowerShell frees memory by ENDING processes, not flushing RAM;' -ForegroundColor DarkGray
+    Write-Host '   the biggest lever on this fleet is browsers - see option 4.)' -ForegroundColor DarkGray
+
+    # Aggregate by process name so all of Chrome's tabs sum to one line.
+    $groups = Get-Process | Group-Object ProcessName | ForEach-Object {
+        [pscustomobject]@{
+            Name  = $_.Name
+            Count = $_.Count
+            WS_MB = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum / 1MB)
+        }
+    } | Where-Object { $CriticalProcs -notcontains $_.Name } | Sort-Object WS_MB -Descending | Select-Object -First 15
+
+    Write-Host ''
+    Write-Host ('  {0,-3} {1,-22} {2,6} {3,10}' -f '#', 'Process', 'Count', 'Memory') -ForegroundColor White
+    Write-Host ('  ' + ('-' * 44)) -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $groups.Count; $i++) {
+        Write-Host ('  {0,-3} {1,-22} {2,6} {3,8} MB' -f ($i + 1), $groups[$i].Name, $groups[$i].Count, $groups[$i].WS_MB)
+    }
+    Write-Host '  (system-critical processes are hidden and cannot be ended here)' -ForegroundColor DarkGray
+
+    $pick = (Read-Host '  Numbers to END (comma-separated), or Enter to skip').Trim()
+    if (-not $pick) { Write-Warn 'Nothing ended.'; return }
+    foreach ($n in ($pick -split '[, ]+' | Where-Object { $_ })) {
+        $idx = 0
+        if ([int]::TryParse($n, [ref]$idx) -and $idx -ge 1 -and $idx -le $groups.Count) {
+            $name = $groups[$idx - 1].Name
+            if ($CriticalProcs -contains $name) { Write-Warn "$name is protected - skipped."; continue }
+            Stop-Process -Name $name -Force -ErrorAction SilentlyContinue
+            Write-Ok "Ended $name."
+        }
+    }
+    Write-Host ("  RAM free now: {0} GB" -f [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)) -ForegroundColor White
+}
+
+
+# =========================================================================
+#  4. CLOSE BROWSERS  (warn logged-on user, then close gracefully)
+# =========================================================================
+function Invoke-CloseBrowsers {
+    Write-Sub 'CLOSE BROWSERS'
+    $names = 'msedge', 'chrome', 'firefox', 'brave', 'opera', 'iexplore'
+    $procs = Get-Process -Name $names -ErrorAction SilentlyContinue
+    if (-not $procs) { Write-Ok 'No browsers are running.'; return }
+
+    $procs | Group-Object ProcessName | ForEach-Object {
+        Write-Host ('  {0,-10} {1,3} process(es)  {2,6} MB' -f $_.Name, $_.Count,
+            [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum / 1MB))
+    }
+    Write-Warn 'Closing browsers loses open tabs - work here is web apps with unsaved state.'
+
+    # Warn whoever is actively logged on (skip if it is only an IT account).
+    $sessions = @(quser 2>$null | Select-Object -Skip 1 | ForEach-Object {
+            $f = ($_ -replace '^\>', '') -split '\s{2,}'
+            [pscustomobject]@{ User = $f[0].Trim(); Id = ($f | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1); State = ($_ -match 'Active') }
+        })
+    $realUsers = @($sessions | Where-Object { $_.State -and ($Site.ItUsers -notcontains $_.User.ToLower()) })
+    if ($realUsers -and (Confirm-Action ("Warn logged-on user(s) [{0}] first?" -f ($realUsers.User -join ', ')))) {
+        foreach ($s in $realUsers) {
+            if ($s.Id) { & msg.exe $s.Id "IT is freeing up memory on this PC. Please SAVE YOUR WORK - browsers will close in a moment." 2>$null }
+        }
+        Write-Step 'warned; waiting 15s for them to save ...'
+        Start-Sleep -Seconds 15
+    }
+
+    if (-not (Confirm-Action 'Close all browsers now?')) { Write-Warn 'Skipped.'; return }
+
+    # Graceful first: WM_CLOSE lets the browser offer tab-restore next launch.
+    foreach ($p in $procs) { $p.CloseMainWindow() | Out-Null }
+    Start-Sleep -Seconds 5
+    $still = Get-Process -Name $names -ErrorAction SilentlyContinue
+    if ($still) {
+        Write-Warn ("{0} browser process(es) did not close gracefully." -f $still.Count)
+        if (Confirm-Action 'Force-kill the stragglers?') {
+            $still | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Ok 'Forced closed.'
+        }
+    } else { Write-Ok 'All browsers closed gracefully.' }
+}
+
+
+# =========================================================================
+#  MENU
+# =========================================================================
+function Show-Menu {
+    Write-Host ''
+    Write-Host ('=' * 44) -ForegroundColor Cyan
+    Write-Host ("  CLEANUP    C: free {0} GB" -f (Get-CFreeGB)) -ForegroundColor Cyan
+    Write-Host ('=' * 44) -ForegroundColor Cyan
+    Write-Host '  1.  Flush temp & caches     (all user profiles)'
+    Write-Host '  2.  Reclaim C: drive        (snapshots / WU / recycle)'
+    Write-Host '  3.  Free memory             (top consumers)'
+    Write-Host '  4.  Close browsers          (warn user, graceful)'
+    Write-Host '  5.  Do all                  (1 + safe disk + 4)'
+    Write-Host '  0.  exit'
+}
+
+$done = $false
+while (-not $done) {
+    Show-Menu
+    switch ((Read-Host '  choose').Trim()) {
+        '1' { Invoke-TempFlush }
+        '2' { Invoke-DiskReclaim }
+        '3' { Invoke-FreeMemory }
+        '4' { Invoke-CloseBrowsers }
+        '5' {
+            Invoke-TempFlush
+            Invoke-DiskReclaim
+            Invoke-CloseBrowsers
+        }
+        '0' { $done = $true }
+        default { Write-Warn 'Pick a number from the menu.' }
+    }
+}
+
+if ($reportFile) {
+    try { Stop-Transcript | Out-Null } catch { }
+    Write-Host ''
+    Write-Host '  Report saved:' -ForegroundColor DarkGray
+    Write-Host "    $reportFile" -ForegroundColor DarkGray
+    if ($reportFile -notlike '\\*') { Write-Host '    (share unreachable - saved locally)' -ForegroundColor DarkGray }
+}
