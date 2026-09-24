@@ -4,7 +4,7 @@
 #
 #  AUTHOR
 #  ------
-#  KUDADONBE (KD)  -  Computer Consultancy
+#  KD  -  Computer Consultancy
 #  kudadonbe@outlook.com
 #
 #  WHAT IT DOES
@@ -71,12 +71,17 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 #  CONSOLE
 # ---------------------------------------------------------------------------
+# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
 function Write-Head($text) {
+    # The banner that opens a tool or a stage. 62 wide: the plurality of the
+    # tools already used it, it clears the longest heading in the toolkit, and
+    # it fits an 80-column console with room to spare.
     Write-Host ''
     Write-Host ('=' * 62) -ForegroundColor Cyan
     Write-Host "  $text" -ForegroundColor Cyan
     Write-Host ('=' * 62) -ForegroundColor Cyan
 }
+
 function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
 function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
 function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
@@ -84,17 +89,27 @@ function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
 function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
 function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
 
-function Confirm-Action($prompt) { (Read-Host "  $prompt (y/n)") -match '^[Yy]' }
+# --- asking, which is as much the house voice as printing ------------------
+#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
+#  two were written out in eight tools between them - identical but for the
+#  parameter name - which is a rule kept by hand, and a rule kept by hand is
+#  one that drifts the first time somebody is in a hurry.
 
-# y/n where a bare Enter takes the default, so a run of prompts goes quickly.
+function Confirm-Action($prompt) {
+    # A plain yes/no. Anything not starting with y is no, so Enter is no.
+    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
+}
+
 function Confirm-Default($prompt, $default) {
-    $hint = 'y/N'
-    if ($default) { $hint = 'Y/n' }
+    # The same, but Enter takes the default and the prompt SAYS which - never
+    # "[default]" or a bare "(y/n)" that hides it.
+    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
     $a = (Read-Host "  $prompt ($hint)").Trim()
     if (-not $a) { return $default }
     return ($a -match '^[Yy]')
 }
-
+# <#/VOICE#>
+# y/n where a bare Enter takes the default, so a run of prompts goes quickly.
 function Format-Size($bytes) {
     if (-not $bytes) { return '0 B' }
     if ($bytes -ge 1TB) { return ('{0:N1} TB' -f ($bytes / 1TB)) }
@@ -1026,12 +1041,27 @@ function Save-Extras([string]$Dir, [bool]$Live) {
     } catch { Write-Warn "mapped drives: $($_.Exception.Message)" }
 
     try {
-        $lines = @()
-        foreach ($n in (Get-NetIPConfiguration -ErrorAction SilentlyContinue)) {
-            $lines += ('-- {0}' -f $n.InterfaceAlias)
-            $lines += ('   IPv4    : {0}' -f ($n.IPv4Address.IPAddress -join ', '))
-            $lines += ('   Gateway : {0}' -f ($n.IPv4DefaultGateway.NextHop -join ', '))
-            $lines += ('   DNS     : {0}' -f ($n.DNSServer.ServerAddresses -join ', '))
+        # Read off Get-NetAdapter / Get-NetIPAddress, NOT Get-NetIPConfiguration.
+        # That cmdlet throws "Exception setting NetProfile" on any PC holding
+        # more than one connection profile for an interface, and the throw is
+        # terminating - -ErrorAction does not suppress it, so it does not just
+        # lose this file, it ends the backup. Get-KdIpConfig in
+        # config/functions.ps1 is the shared version; inlined here because this
+        # tool carries no <#FUNCTIONS#> block. Keep the two in step.
+        $lines  = @()
+        $addrs  = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' })
+        $dnsSrv = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        foreach ($a in (Get-NetAdapter -ErrorAction SilentlyContinue)) {
+            $ix  = $a.InterfaceIndex
+            if (-not $ix) { $ix = $a.ifIndex }
+            $ip4 = @($addrs | Where-Object { $_.InterfaceIndex -eq $ix })
+            if (-not $ip4.Count) { continue }
+            $lines += ('-- {0}' -f $a.Name)
+            $lines += ('   IPv4    : {0}' -f (($ip4 | ForEach-Object { $_.IPAddress }) -join ', '))
+            $lines += ('   Gateway : {0}' -f ((@($routes | Where-Object { $_.InterfaceIndex -eq $ix }) | ForEach-Object { $_.NextHop }) -join ', '))
+            $lines += ('   DNS     : {0}' -f ((@($dnsSrv | Where-Object { $_.InterfaceIndex -eq $ix }) | ForEach-Object { $_.ServerAddresses }) -join ', '))
             $lines += ''
         }
         Set-Content -LiteralPath (Join-Path $Dir 'network-config.txt') -Value $lines -Encoding UTF8
@@ -1092,7 +1122,7 @@ function Save-RestoreReadme([string]$Root, $Stats) {
         '  on the old PC. Drag Documents, Desktop, Pictures, Downloads and the rest',
         '  into the matching folders of the new profile. Nothing here needs a tool.',
         '',
-        '  Or run the backup-restore tool from the KUDADONBE menu: it checks the',
+        '  Or run the backup-restore tool from the avas menu: it checks the',
         '  files against the manifest, scans them with Defender, and copies them',
         '  back without ever overwriting anything.',
         '',
@@ -1135,7 +1165,7 @@ function Save-RestoreReadme([string]$Root, $Stats) {
         '  USB pen or another drive BEFORE you start the reinstall.',
         '',
         '===========================================================================',
-        '  KUDADONBE (KD)  -  Computer Consultancy',
+        '  KD  -  Computer Consultancy',
         '  kudadonbe@outlook.com',
         '==========================================================================='
     )
@@ -1199,11 +1229,11 @@ if ($env:KD_BACKUP_SRC) {
     $srcUsersRoot = $env:KD_BACKUP_SRC
     Write-Step "using KD_BACKUP_SRC = $srcUsersRoot"
 } else {
-    Write-Host '  1.  This PC            C:\Users'
-    Write-Host '  2.  Another disk       slaved or USB-docked - you type the path'
-    Write-Host '  3.  A single folder    any path at all'
-    Write-Host '  0.  Cancel'
-    $pick = (Read-Host '  Choice').Trim()
+    Write-Host '   1.  This PC            C:\Users'
+    Write-Host '   2.  Another disk       slaved or USB-docked - you type the path'
+    Write-Host '   3.  A single folder    any path at all'
+    Write-Host '   0.  Cancel'
+    $pick = (Read-Host '  Choose').Trim()
     if ($pick -eq '1' -or $pick -eq '') { $srcUsersRoot = 'C:\Users' }
     elseif ($pick -eq '2' -or $pick -eq '3') {
         Write-Host ''
@@ -1266,7 +1296,7 @@ for ($i = 0; $i -lt $profileDirs.Count; $i++) {
     Write-Host ("  {0,2}.  {1,-28}  last document {2}" -f ($i + 1), $p.Name, $last)
 }
 Write-Host ''
-$sel = (Read-Host '  Which? (Enter = all, or 1,3,4)').Trim()
+$sel = (Read-Host '  Choose (e.g. 1,3,4, Enter = all)').Trim()
 $chosen = $profileDirs
 if ($sel) {
     $idx = @($sel -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ - 1 })
@@ -1465,7 +1495,7 @@ while (-not $destRoot) {
     Write-Host '   S.  Shrink C: to make a rescue partition   (last resort - read the warning)'
     Write-Host '   0.  Cancel'
     Write-Dim 'Borrowing any external drive or a second pen beats shrinking C:.'
-    $pick = (Read-Host '  Choice').Trim()
+    $pick = (Read-Host '  Choose').Trim()
 
     if ($pick -eq '0') { Write-Warn 'Cancelled. Nothing was written.'; return }
     elseif ($pick -match '^[Pp]$') {
@@ -1509,11 +1539,11 @@ if ($penCands.Count -gt 0) {
     Show-Volumes $penCands $need
     Write-Host ''
     Write-Host '   n.  No second copy'
-    $pp = (Read-Host '  Choice').Trim()
+    $pp = (Read-Host '  Choose').Trim()
     if ($pp -match '^\d+$' -and [int]$pp -ge 1 -and [int]$pp -le $penCands.Count) {
         $pen = $penCands[[int]$pp - 1]
         if (Test-Path -LiteralPath (Join-Path "$($pen.Letter)\" 'network-tools')) {
-            Write-Warn 'That is the KUDADONBE tools pen. Filling it with user data risks'
+            Write-Warn 'That is the KD tools pen. Filling it with user data risks'
             Write-Warn 'the tools you need for the rebuild.'
             if (-not (Confirm-Action 'Use it anyway?')) { $pen = $null }
         }

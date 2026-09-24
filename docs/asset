@@ -4,7 +4,7 @@
 #
 #  AUTHOR
 #  ------
-#  KUDADONBE (KD)  -  Computer Consultancy
+#  KD  -  Computer Consultancy
 #
 #  WHAT IT DOES
 #  ------------
@@ -67,6 +67,17 @@ function Test-AssetNo([string]$no) {
     return $no -match '^[A-Z0-9]{2,4}-\d{4}-(0?[1-9]|290)-\d{1,3}-\d{1,4}[A-Z]?$'
 }
 
+function Test-KdSerial([string]$serial) {
+    # Is this a REAL BIOS serial, or the placeholder a board vendor ships when
+    # nobody programmed one ("To be filled by O.E.M.", "System Serial Number",
+    # "Default string", all zeros, blank)? Custom builds and some clones carry
+    # the placeholder, and a placeholder must never be used as a device key -
+    # every such PC would collapse into one. The ONE definition, shared by the
+    # asset backup (which files by serial) and sysinfo (which reports it).
+    if (-not $serial) { return $false }
+    return -not ($serial -match '^(To be filled|Default|None|System Serial|0+$|\s*$)')
+}
+
 function Get-AssetBackupFile {
     # Where this PC's asset-number backup lives on the office share - keyed by
     # the BIOS SERIAL, the one identifier a format cannot erase. So the tag
@@ -75,7 +86,7 @@ function Get-AssetBackupFile {
     # ShareBase) or when the firmware has no usable serial.
     if (-not ($Site -and $Site.ShareBase)) { return $null }
     $serial = (Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue).SerialNumber
-    if (-not $serial -or $serial -match '^(To be filled|Default|None|System Serial|0+$|\s*$)') { return $null }
+    if (-not (Test-KdSerial $serial)) { return $null }
     $safe = ($serial.Trim() -replace '[^\w\.-]', '_')
     return Join-Path $Site.ShareBase ("reports\assets\{0}.txt" -f $safe)
 }
@@ -106,6 +117,39 @@ function Save-AssetBackup {
         foreach ($k in $rec.Keys) { $lines += "$k=$($rec[$k])" }
         Set-Content -Path $file -Value $lines -Encoding UTF8
     } catch { }
+}
+
+function ConvertTo-KdAccountName([string]$ProfileName, [string]$PcName = $env:COMPUTERNAME) {
+    # A profile FOLDER is not always the account's name. When C:\Users\<name>
+    # is already taken - a local account of the same name, or a profile left
+    # by an earlier join - Windows makes the new one <name>.<DOMAIN>,
+    # <name>.<PCNAME> or <name>.000. Matched as it stands, 'first.last.DOMAIN'
+    # is on no IT list and in no directory, which is how a PC set up by IT
+    # came to be filed under the technician who set it up (2026-09-21).
+    # Only those three suffixes are taken off: 'first.last' must never be
+    # read as 'first'.
+    # They STACK: a third profile for the same account is 'name.DOMAIN.001'
+    # (seen 2026-09-22), so they come off one at a time until none is left.
+    if (-not $ProfileName) { return '' }
+    $suffixes = @($PcName)
+    if ($Site -and $Site.Domain) { $suffixes += ("$($Site.Domain)" -split '\.')[0] }
+    $suffixes = @($suffixes | Where-Object { $_ })
+    $name = $ProfileName
+    while ($true) {
+        $before = $name
+        foreach ($s in $suffixes) { if ($name -match "^(.+)\.$([regex]::Escape($s))$") { $name = $Matches[1] } }
+        if ($name -match '^(.+)\.\d{3}$') { $name = $Matches[1] }
+        if ($name -eq $before) { return $name }
+    }
+}
+
+function Test-KdItAccount([string]$Account, [string]$PcName = $env:COMPUTERNAME) {
+    # Is this one of the IT / admin accounts in the site config - the people
+    # who set PCs up, not the people who use them? Takes a profile folder
+    # name as readily as an account: see ConvertTo-KdAccountName.
+    if (-not $Account -or -not ($Site -and $Site.ItUsers)) { return $false }
+    $it = @($Site.ItUsers | ForEach-Object { "$_".ToLower() })
+    return (($it -contains $Account.ToLower()) -or ($it -contains (ConvertTo-KdAccountName $Account $PcName).ToLower()))
 }
 
 function Get-PrimaryUser {
@@ -184,10 +228,16 @@ function Get-PrimaryUser {
             Files       = $fileCount
             DocLatest   = $docLatest
             LoginLatest = $loginLatest
-            IsIT        = ($itUsers -contains $p.Name.ToLower())
+            IsIT        = (Test-KdItAccount $p.Name)
         }
     }
 
+    # HOW the answer was reached is left in $script:KdPrimaryUserBasis, so the
+    # report can say it and the fleet can show it as the reason a PC is filed
+    # under a person: 'work' (newest document activity), 'it-own' (an IT
+    # profile that plainly works here), 'signed-in', 'logon' (newest logon),
+    # 'it-only' (nobody but IT has used the PC - a fresh setup), 'unknown'.
+    $script:KdPrimaryUserBasis = 'unknown'
     if (-not $scored) { return 'unknown' }
 
     # --- Rank by real work: most recent document activity first -------------
@@ -202,17 +252,21 @@ function Get-PrimaryUser {
         if ($bestIt -and
             $bestIt.DocLatest -gt $bestNonIt.DocLatest -and
             $bestIt.Files -ge (2 * [Math]::Max($bestNonIt.Files, 1))) {
+            $script:KdPrimaryUserBasis = 'it-own'
             return $bestIt.Name
         }
+        $script:KdPrimaryUserBasis = 'work'
         return $bestNonIt.Name
     }
 
-    if ($bestIt) { return $bestIt.Name }   # only IT has ever worked here
-
-    # --- Fallback: no document activity was readable ------------------------
-    # We are running as a normal user, so NTFS hid everyone else's Documents.
-    # The only signals left are who is logged in, and logon times.
+    # --- Fallback: no staff document activity was readable ------------------
+    # Either we run as a normal user and NTFS hid everyone else's Documents,
+    # or the only documents on the PC are IT's - a technician signs in to
+    # every new PC to check the domain join, and that must not make the PC
+    # theirs. The signals left are who is logged in, and logon times; a staff
+    # profile found by either one beats an IT profile found by its documents.
     if ($me -and ($itUsers -notcontains $me.ToLower()) -and ($me -notmatch '\$$')) {
+        $script:KdPrimaryUserBasis = 'signed-in'
         return $me
     }
 
@@ -220,10 +274,41 @@ function Get-PrimaryUser {
     # Not as good as document activity, but it beats naming the PC after IT.
     $byLogin = @($scored | Where-Object { -not $_.IsIT -and $_.LoginLatest } |
                  Sort-Object LoginLatest -Descending) | Select-Object -First 1
-    if ($byLogin) { return $byLogin.Name }
+    if ($byLogin) { $script:KdPrimaryUserBasis = 'logon'; return $byLogin.Name }
 
+    # Nobody but IT has ever used this PC. The name is returned because a
+    # report needs one, but the basis says what it is worth: the fleet files
+    # such a PC as unassigned, never under the technician.
+    $script:KdPrimaryUserBasis = 'it-only'
+    if ($bestIt) { return $bestIt.Name }
     if ($me) { return $me }
+    $script:KdPrimaryUserBasis = 'unknown'
     return 'unknown'
+}
+
+function Get-KdAssignment {
+    # WHO THIS PC WAS GIVEN TO, as a technician recorded it on the PC itself
+    # (newpc asks at setup). Kept in the org's registry key beside the asset
+    # number, so every later sysinfo report carries it without anyone being
+    # asked again. Returns $null when nothing was recorded.
+    $p = Get-ItemProperty (Join-Path (Get-OrgRegKey) 'Assignment') -ErrorAction SilentlyContinue
+    if (-not $p -or -not "$($p.Person)".Trim()) { return $null }
+    return [pscustomobject]@{
+        Person = "$($p.Person)".Trim(); Reason = "$($p.Reason)".Trim(); Note = "$($p.Note)".Trim()
+        By     = "$($p.By)".Trim();     Date   = "$($p.Date)".Trim()
+    }
+}
+
+function Set-KdAssignment([string]$Person, [string]$Reason, [string]$Note = '') {
+    # Record the assignment on the PC (needs elevation - HKLM). $true when it
+    # was written. 'By' is read from the token: see Get-KdWhoAmI.
+    try {
+        $key = Join-Path (Get-OrgRegKey) 'Assignment'
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force -ErrorAction Stop | Out-Null }
+        $vals = [ordered]@{ Person = $Person; Reason = $Reason; Note = $Note; By = ((Get-KdWhoAmI) -split '\\')[-1]; Date = (Get-Date -Format 'yyyy-MM-dd') }
+        foreach ($k in $vals.Keys) { Set-ItemProperty -Path $key -Name $k -Value "$($vals[$k])" -ErrorAction Stop }
+        return $true
+    } catch { return $false }
 }
 
 function Write-KdToolLog([string]$Tool, [string]$Message) {
@@ -234,8 +319,13 @@ function Write-KdToolLog([string]$Tool, [string]$Message) {
     # reports\tool-usage\ when the share is unreachable (sync-pen-reports
     # carries the pen's reports up later). Logging must NEVER break a tool:
     # every failure here is silent, and the function returns nothing.
+    # WHO from the token, not the environment: a window elevated as another
+    # account carries $env:USERNAME = SYSTEM, and a month of the A1 desk's
+    # rows read "SYSTEM ran rename-pc" (2026-09-23). See Get-KdWhoAmI. The
+    # bare account name, so the column keeps the shape worklog reads.
+    $who = ((Get-KdWhoAmI) -split '\\')[-1]
     $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
-        $env:COMPUTERNAME, $env:USERNAME, $Tool, ($Message -replace '[\r\n\t]+', ' ')
+        $env:COMPUTERNAME, $who, $Tool, ($Message -replace '[\r\n\t]+', ' ')
     $rel = Join-Path 'reports\tool-usage' ("{0}.log" -f (Get-Date -Format 'yyyy-MM'))
     $targets = @()
     if ($Site -and $Site.ShareBase) { $targets += Join-Path $Site.ShareBase $rel }
@@ -257,6 +347,18 @@ function Write-KdToolLog([string]$Tool, [string]$Message) {
     }
 }
 
+function Set-KdRunFailed([string]$Why) {
+    # A tool that prints its failure and RETURNS politely looks, from the
+    # menu, exactly like one that succeeded: nothing was thrown, so the usage
+    # log said "finished" - two domain-join runs that failed at the leave on
+    # 2026-09-23 read as "finished domain-join (45s)". The tool says so here
+    # instead, and the menu logs FAILED with the reason after the run.
+    # GLOBAL, because the tool runs as a scriptblock inside the menu's
+    # session and a script-scoped flag would not cross that boundary. The
+    # menus clear it before every launch; only the first reason is kept.
+    if (-not $global:KdRunFailure) { $global:KdRunFailure = $Why }
+}
+
 function Start-KdTranscript([string]$Tool) {
     # Begin a FULL console transcript of a tool run (everything the tool
     # printed - the automated version of saving the console output by hand,
@@ -264,11 +366,22 @@ function Start-KdTranscript([string]$Tool) {
     # locally first so a mid-run share hiccup cannot break the tool;
     # Complete-KdTranscript ships it afterwards. Returns the local path, or
     # $null when the transcript could not start (never an error).
+    #
+    # NESTING IS THE NORMAL CASE, not an error. Every shipped tool opens one
+    # of these itself - that is what gives a transcript to a tool run straight
+    # from a console, with no menu above it - and the avas menu opens one too
+    # when it launches a tool. Only the OUTER one records; the inner call sees
+    # a transcript already running and returns $null, so Complete-KdTranscript
+    # has nothing to stop and the single file stays whole. Windows PowerShell
+    # throws on a second Start-Transcript, pwsh 7 quietly starts a second file
+    # and ends the first - so the flag decides, not the engine.
+    if ($global:KdTranscriptActive) { return $null }
     try {
         $dir = Join-Path $env:TEMP 'kd-transcripts'
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
         $p = Join-Path $dir ("{0}_{1}_{2}.txt" -f $Tool, $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss'))
         Start-Transcript -Path $p -ErrorAction Stop | Out-Null
+        $global:KdTranscriptActive = $true
         return $p
     } catch { return $null }
 }
@@ -276,11 +389,44 @@ function Start-KdTranscript([string]$Tool) {
 function Complete-KdTranscript([string]$Path) {
     # Stop the transcript and ship it to <share>\reports\transcripts\, or the
     # pen's reports\transcripts\ when off-LAN (sync-pen-reports carries those
-    # up later). No destination at all (public build, no pen): the local file
-    # is deleted rather than left behind. Silent on every failure.
+    # up later). Silent on every failure.
+    #
+    # A TRANSCRIPT IS NEVER THROWN AWAY. When no destination will take it -
+    # off the LAN with no pen in, or the share refusing this account - the
+    # file STAYS in %TEMP%\kd-transcripts and the next run that can reach a
+    # destination carries the whole backlog up with it. The old version
+    # deleted it, which meant the runs most worth reading, the ones on a PC
+    # that could not reach the share, were exactly the ones that left nothing
+    # behind.
     if (-not $Path) { return }
     try { Stop-Transcript | Out-Null } catch { }
+    $global:KdTranscriptActive = $false
     if (-not (Test-Path $Path)) { return }
+    $dirs = Get-KdTranscriptTargets
+    if ($dirs.Count -eq 0) {
+        # Nowhere configured at all - the public build, on somebody's own PC.
+        # Nothing of ours belongs in their %TEMP%, so the file goes. A site
+        # build always has a ShareBase, so its transcripts are kept instead.
+        if (-not ($Site -and ($Site.ShareBase -or $Site.PenMarker))) {
+            Remove-Item $Path -Force -ErrorAction SilentlyContinue
+        }
+        return                            # otherwise: kept for a later run
+    }
+    foreach ($d in $dirs) {
+        try {
+            if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+            Copy-Item $Path (Join-Path $d (Split-Path $Path -Leaf)) -Force -ErrorAction Stop
+            Remove-Item $Path -Force -ErrorAction SilentlyContinue
+            Send-KdTranscriptBacklog $d
+            return
+        } catch { }
+    }
+}
+
+function Get-KdTranscriptTargets {
+    # Where a finished transcript may go, nearest first: the share, then any
+    # pen plugged in. Both may be absent, and that is not a failure - see
+    # Complete-KdTranscript.
     $dirs = @()
     if ($Site -and $Site.ShareBase) { $dirs += Join-Path $Site.ShareBase 'reports\transcripts' }
     if ($Site -and $Site.PenMarker) {
@@ -291,15 +437,54 @@ function Complete-KdTranscript([string]$Path) {
             }
         }
     }
-    foreach ($d in $dirs) {
+    return $dirs
+}
+
+function Send-KdTranscriptBacklog([string]$Dir) {
+    # Carry up whatever earlier runs left behind in %TEMP%\kd-transcripts
+    # because nothing would take them at the time. Runs after a successful
+    # ship, so it only ever fires on a PC that has just proved it can reach
+    # the destination. Silent, and never touches the file being written now.
+    if (-not $Dir) { return }
+    $local = Join-Path $env:TEMP 'kd-transcripts'
+    if (-not (Test-Path $local)) { return }
+    foreach ($f in @(Get-ChildItem $local -Filter '*.txt' -File -ErrorAction SilentlyContinue)) {
         try {
-            if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
-            Copy-Item $Path (Join-Path $d (Split-Path $Path -Leaf)) -Force -ErrorAction Stop
-            Remove-Item $Path -Force -ErrorAction SilentlyContinue
-            return
+            Copy-Item $f.FullName (Join-Path $Dir $f.Name) -Force -ErrorAction Stop
+            Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
         } catch { }
     }
-    Remove-Item $Path -Force -ErrorAction SilentlyContinue
+}
+
+function Get-KdPathVariants([string]$Path) {
+    # A UNC path, plus the same path with the server named the OTHER way.
+    # Windows keeps a stored credential per TARGET: an entry for the server's
+    # NAME does nothing for its IP address. So a PC signed in with a local
+    # account routinely reaches the share by name and not by IP (or the
+    # reverse), and a path baked in one form simply fails on it.
+    $out = @($Path)
+    if ($Path -match '^\\\\([^\\]+)\\(.+)$') {
+        $srv = $Matches[1]; $rest = $Matches[2]
+        try {
+            if ($srv -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                $n = ([Net.Dns]::GetHostEntry($srv)).HostName
+                if ($n) { $out += "\\$(($n -split '\.')[0])\$rest" }
+            } else {
+                $a = ([Net.Dns]::GetHostAddresses($srv) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                      Select-Object -First 1).IPAddressToString
+                if ($a) { $out += "\\$a\$rest" }
+            }
+        } catch { }
+    }
+    return @($out | Select-Object -Unique)
+}
+
+function Resolve-KdSharePath([string]$Path) {
+    # The first form of $Path this PC can actually open, or $null.
+    foreach ($p in (Get-KdPathVariants $Path)) {
+        if (Test-Path $p -ErrorAction SilentlyContinue) { return $p }
+    }
+    return $null
 }
 
 function Invoke-KdTool([string]$Name) {
@@ -319,8 +504,9 @@ function Invoke-KdTool([string]$Name) {
         }
     }
     if (-not $code -and $Site -and $Site.ShareBase) {
-        $p = Join-Path $Site.ShareBase "$Name.txt"
-        if (Test-Path $p -ErrorAction SilentlyContinue) { try { $code = Get-Content $p -Raw -ErrorAction Stop } catch { } }
+        # By IP or by name, whichever this PC can reach - see Get-KdPathVariants.
+        $p = Resolve-KdSharePath (Join-Path $Site.ShareBase "$Name.txt")
+        if ($p) { try { $code = Get-Content $p -Raw -ErrorAction Stop } catch { } }
     }
     if (-not $code -and $Site -and $Site.PublicBase) {
         try { $code = Invoke-RestMethod -Uri "$($Site.PublicBase)/$Name" -ErrorAction Stop } catch { }
@@ -332,6 +518,65 @@ function Invoke-KdTool([string]$Name) {
     Write-Host "  Launching $Name ..." -ForegroundColor Cyan
     Write-Host ''
     & ([scriptblock]::Create($code))
+}
+
+function Get-KdToolCommand([string]$Name) {
+    # The one-line command that runs tool $Name from the nearest source - for
+    # handing to ANOTHER PowerShell process. Invoke-KdTool fetches the text and
+    # runs it HERE; this hands over the address instead, which is what a
+    # relaunch in a different engine needs. Same order of sources, so the two
+    # can never point at different copies: pen, then share, then the hub.
+    if (-not $Name) { return $null }
+    $pen = Get-KdPenFolder
+    if ($pen) {
+        $f = Join-Path $pen "$Name.txt"
+        if (Test-Path $f -ErrorAction SilentlyContinue) { return "iex (Get-Content -Raw '$f')" }
+    }
+    if ($Site -and $Site.ShareBase) {
+        $f = Resolve-KdSharePath (Join-Path $Site.ShareBase "$Name.txt")
+        if ($f) { return "iex (Get-Content -Raw '$f')" }
+    }
+    if ($Site -and $Site.PublicBase) { return "irm $($Site.PublicBase)/$Name | iex" }
+    return $null
+}
+
+function Restart-KdToolIn51 {
+    # Re-open one tool in WINDOWS POWERSHELL 5.1, elevated.
+    #
+    # newpc and domain-join cannot run under PowerShell 7: Add-Computer was
+    # never ported, so joining a domain there goes through the
+    # WinPSCompatSession, and handing a PSCredential across that boundary is
+    # unreliable - the address gets set and then the join fails. They used to
+    # stop and tell the technician to open another window and start again,
+    # which throws away the menu, the account typed for this window, and the
+    # place they had got to. 5.1 is at a fixed path on every Windows 10 and 11,
+    # so the tool can just move itself. rename-pc is NOT one of them -
+    # Rename-Computer is native in 7 - and calls this only as its fallback
+    # when a rename fails there.
+    param([string]$Name)
+    $cmd = Get-KdToolCommand $Name
+    if (-not $cmd) {
+        Write-Host "  !   Could not find $Name on the pen, the share or the hub." -ForegroundColor Yellow
+        return $false
+    }
+    $ps51 = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path $ps51)) {
+        Write-Host '  !   Windows PowerShell 5.1 is not at its usual path on this PC.' -ForegroundColor Yellow
+        return $false
+    }
+    try {
+        # -NoExit so the window stays open at the end for whatever it reports.
+        # RunAs because all three of these tools need elevation anyway, and
+        # asking once here beats failing on the first step that needs it.
+        $null = Start-Process $ps51 -Verb RunAs -ArgumentList `
+                    "-NoProfile -ExecutionPolicy Bypass -NoExit -Command `"$cmd`"" -ErrorAction Stop
+        Write-Host "  OK  $Name is opening in Windows PowerShell 5.1 (a new window)." -ForegroundColor Green
+        Write-Host '      Carry on in that window; this one can be left as it is.' -ForegroundColor DarkGray
+        return $true
+    } catch {
+        Write-Host "  X   Could not start Windows PowerShell 5.1: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
 }
 
 function Update-PcReport([string]$PcName) {
@@ -348,18 +593,1257 @@ function Update-PcReport([string]$PcName) {
     try     { Invoke-KdTool 'sysinfo' }
     finally { Remove-Item Env:\KD_PCNAME -ErrorAction SilentlyContinue }
 }
+
+function Get-KdIpBands {
+    # The office address plan from $Site.IpBands ('from-to=kind=label'), as
+    # objects { From; To; Kind; Label } in address order. Empty when the site
+    # has no plan - then the whole subnet is one band and nothing is judged.
+    $bands = @()
+    if (-not ($Site -and $Site.IpBands)) { return $bands }
+    foreach ($b in @($Site.IpBands)) {
+        if ("$b" -match '^\s*(\d{1,3})\s*-\s*(\d{1,3})\s*=\s*([a-z]+)\s*=\s*(.*?)\s*$') {
+            $bands += [pscustomobject]@{ From = [int]$Matches[1]; To = [int]$Matches[2]; Kind = $Matches[3].ToLower(); Label = $Matches[4] }
+        }
+    }
+    return @($bands | Sort-Object From)
+}
+
+function Get-KdIpBand([int]$Octet) {
+    # The band an octet falls in, or $null when the plan has no band there.
+    foreach ($b in (Get-KdIpBands)) { if ($Octet -ge $b.From -and $Octet -le $b.To) { return $b } }
+    return $null
+}
+
+function Show-KdIpPlan([hashtable]$FreeByBand) {
+    # The address plan as a small table, shown wherever an address is asked
+    # for, so the technician picks from the right range without looking it
+    # up - and the BALANCE of each range: size, used, free, and the first
+    # free octets. $FreeByBand: kind -> list of free octets (the caller knows
+    # what is free); without it only the plan is shown.
+    $bands = @(Get-KdIpBands)
+    if (-not $bands) { return }
+    $sub = $(if ($Site -and $Site.Subnet) { $Site.Subnet } else { 'x.x.x' })
+    Write-Host "  Address plan for $sub.0/24:" -ForegroundColor White
+    Write-Host ("    {0,-10} {1,-9} {2,-52}{3}" -f 'range', 'for', '', $(if ($FreeByBand) { 'size  used  free   first free' } else { '' })) -ForegroundColor DarkGray
+    foreach ($b in $bands) {
+        $range = ".{0}-.{1}" -f $b.From, $b.To
+        $line = "    {0,-10} {1,-9} {2,-52}" -f $range, $b.Kind, $b.Label
+        if ($FreeByBand -and $FreeByBand.ContainsKey($b.Kind)) {
+            $size = $b.To - $b.From + 1
+            $f = @($FreeByBand[$b.Kind] | Where-Object { $_ -ge $b.From -and $_ -le $b.To } | Sort-Object)
+            $line += "{0,4}  {1,4}  {2,4}   {3}" -f $size, ($size - $f.Count), $f.Count, $(if ($f) { ".$(($f | Select-Object -First 5) -join ', .')$(if ($f.Count -gt 5) { ' ...' })" } else { 'FULL' })
+        }
+        $c = $(if ($b.Kind -in 'desktop', 'laptop') { 'Cyan' } else { 'DarkGray' })
+        Write-Host $line -ForegroundColor $c
+    }
+}
+
+function Test-KdPcBand([int]$Octet) {
+    # Is this an address a PC may live at? True with no plan at all.
+    $bands = @(Get-KdIpBands)
+    if (-not $bands) { return $true }
+    $b = Get-KdIpBand $Octet
+    return ($b -and $b.Kind -in 'desktop', 'laptop')
+}
+
+function Test-KdPing([string]$Target) {
+    # Test-Connection -Quiet is documented to return $false instead of
+    # erroring, and that holds only while the failure is a TIMEOUT. When the
+    # local stack cannot reach the target's network at all, WMI returns
+    # "Generic failure" as an error record - and $ErrorActionPreference =
+    # 'Stop', which several tools set at the top of the file so a half-applied
+    # change cannot roll on, promotes it to a terminating one.
+    #
+    # That state is one these tools CREATE: between setting a static IP and
+    # proving the gateway, a PC on the wrong wire has an address whose network
+    # is not there. On the bench it died with a bare "Generic failure" AFTER
+    # the address was applied - swallowing the message below the gateway check,
+    # which is the one that says to look at the cable. Both guards are needed:
+    # -ErrorAction beats the preference for this call, the catch covers a WMI
+    # fault that throws regardless. An unreachable target is a no-answer, which
+    # is what every caller means by $false.
+    try { return [bool](Test-Connection -ComputerName $Target -Count 2 -Quiet -ErrorAction SilentlyContinue) }
+    catch { return $false }
+}
+
+function ConvertTo-KdPrefixLength([string]$Mask) {
+    # 255.255.255.0 -> 24. Only the WMI fallback below needs it: the Net*
+    # cmdlets carry PrefixLength already, the old WMI class carries a mask.
+    if (-not $Mask) { return 0 }
+    $bits = 0
+    foreach ($o in ($Mask -split '\.')) {
+        $n = 0
+        if ([int]::TryParse($o, [ref]$n)) {
+            while ($n -gt 0) { $bits += ($n -band 1); $n = $n -shr 1 }
+        }
+    }
+    return $bits
+}
+
+function Get-KdIpConfig {
+    # Get-NetIPConfiguration without the bug that takes a whole tool run down.
+    #
+    # THE FIELD FAILURE (FC-A4-124, 2026-09-14): sysinfo died on
+    #   Exception setting "NetProfile": "Cannot convert the "System.Object[]"
+    #   value of type "System.Object[]" to type "...CimInstance"."
+    # and took rename-pc and printer with it - both chain-launch sysinfo to
+    # refresh the inventory after they change the PC, so the rename and the
+    # printer work succeeded and the run still ended in a red error.
+    #
+    # WHY IT THROWS: Get-NetIPConfiguration assembles its output by assigning
+    # Get-NetConnectionProfile's result into a property typed as a SINGLE
+    # CimInstance. A PC holding MORE THAN ONE connection profile for one
+    # interface - ordinary after a rename, a re-join, or any dock/VPN/Hyper-V
+    # adapter - hands that assignment an array and it throws. The throw is
+    # inside the cmdlet's own script body, which makes it TERMINATING:
+    # -ErrorAction SilentlyContinue does not suppress it, and the
+    # $ErrorActionPreference = 'Stop' that our tools set at the top of the
+    # file then ends the run.
+    #
+    # So no tool calls it. This builds the same thing from the cmdlets that
+    # have no such property, and returns objects carrying the property names
+    # the callers already use - .InterfaceAlias, .InterfaceIndex,
+    # .IPv4Address[].IPAddress / .PrefixLength, .IPv4DefaultGateway.NextHop,
+    # .DNSServer[].AddressFamily / .ServerAddresses, .NetAdapter.Status /
+    # .MacAddress - so a call site only swaps the verb.
+    #
+    # -All means what it means on the real cmdlet: every adapter, connected or
+    # not. Without it, only adapters holding an IPv4 address - which is what
+    # the real one returns, disconnected-with-an-APIPA-address included.
+    #
+    # The order is ours, and deliberate: routed adapters first, by route
+    # metric. Every caller that picks one NIC does
+    #   ... | Where IPv4DefaultGateway -and NetAdapter.Status -eq 'Up' |
+    #   Select -First 1
+    # and means "the adapter this PC actually uses". On a PC with the cable in
+    # AND wifi up, Get-NetAdapter's own order could hand that the wifi; route
+    # metric is how Windows itself decides, so this makes the two agree.
+    param([switch]$All)
+
+    $out      = @()
+    $adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue)
+    if ($adapters.Count) {
+        $addrs  = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        # A default route whose next hop is 0.0.0.0 is on-link, not a gateway.
+        # Windows ranks routes by ifMetric + RouteMetric, so that is the sum
+        # sorted on - RouteMetric alone is 256 on every automatic route and
+        # would tie the cable with the wifi.
+        $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+                    Sort-Object { [int]$_.ifMetric + [int]$_.RouteMetric })
+        $dns    = @(Get-DnsClientServerAddress -ErrorAction SilentlyContinue)
+        foreach ($a in $adapters) {
+            $ix  = $a.InterfaceIndex
+            if (-not $ix) { $ix = $a.ifIndex }
+            $ip4 = @($addrs  | Where-Object { $_.InterfaceIndex -eq $ix })
+            if (-not $All -and -not $ip4.Count) { continue }
+            $gw4 = @($routes | Where-Object { $_.InterfaceIndex -eq $ix })
+            $out += [pscustomobject]@{
+                InterfaceAlias     = "$($a.Name)"
+                InterfaceIndex     = $ix
+                IPv4Address        = $ip4
+                IPv4DefaultGateway = $gw4
+                DNSServer          = @($dns    | Where-Object { $_.InterfaceIndex -eq $ix })
+                NetAdapter         = $a
+                # Sort key only - routed-and-up first, then by how Windows
+                # ranks the route. Not a Get-NetIPConfiguration property, so
+                # no caller reads it.
+                KdRank             = $(if ($gw4.Count -and $a.Status -eq 'Up') { [int]@($gw4)[0].ifMetric + [int]@($gw4)[0].RouteMetric } else { [int]::MaxValue })
+            }
+        }
+        return @($out | Sort-Object KdRank, InterfaceIndex)
+    }
+
+    # No NetAdapter module (pre-2012 Windows, or a stripped image). Win32_
+    # NetworkAdapterConfiguration is on every Windows there has ever been, and
+    # a tool reporting "no network" because a module was missing would be the
+    # same lie rule 9 is about.
+    $cfgs = @(Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue)
+    if (-not $All) { $cfgs = @($cfgs | Where-Object { $_.IPEnabled }) }
+    # NetConnectionID is the name the Network Connections window shows, and
+    # only a REAL connection has one. Requiring it (or an address) keeps the
+    # twenty-odd tunnel pseudo-adapters this class reports out of -All, so the
+    # fallback lists what Get-NetAdapter would have listed.
+    $nics = @(Get-CimInstance Win32_NetworkAdapter -ErrorAction SilentlyContinue |
+              Where-Object { $_.NetConnectionID })
+    foreach ($c in $cfgs) {
+        $ips   = @(@($c.IPAddress)  | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+        $masks = @(@($c.IPSubnet)   | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+        $nic   = @($nics | Where-Object { $_.InterfaceIndex -eq $c.InterfaceIndex })
+        if (-not $ips.Count -and -not $nic.Count) { continue }
+        if (-not $All -and -not $ips.Count) { continue }
+        $ip4 = @()
+        for ($i = 0; $i -lt $ips.Count; $i++) {
+            $ip4 += [pscustomobject]@{
+                IPAddress    = "$($ips[$i])"
+                PrefixLength = ConvertTo-KdPrefixLength (@($masks)[$i])
+            }
+        }
+        $out += [pscustomobject]@{
+            InterfaceAlias     = "$(if (@($nic).Count) { @($nic)[0].NetConnectionID } else { $c.Description })"
+            InterfaceIndex     = $c.InterfaceIndex
+            IPv4Address        = $ip4
+            IPv4DefaultGateway = @(@($c.DefaultIPGateway) |
+                Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
+                ForEach-Object { [pscustomobject]@{ NextHop = "$_" } })
+            DNSServer          = @([pscustomobject]@{
+                AddressFamily   = 2
+                ServerAddresses = @(@($c.DNSServerSearchOrder) | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' })
+            })
+            NetAdapter         = [pscustomobject]@{
+                Name       = "$(if (@($nic).Count) { @($nic)[0].NetConnectionID } else { $c.Description })"
+                Status     = "$(if (@($nic).Count -and @($nic)[0].NetConnectionStatus -eq 2) { 'Up' } else { 'Down' })"
+                MacAddress = "$($c.MACAddress)".Replace(':', '-')
+            }
+            # Same contract as above: routed adapters first. This class has no
+            # metric worth trusting, so it is a flag, not a ranking.
+            KdRank             = $(if (@($c.DefaultIPGateway).Count) { 0 } else { [int]::MaxValue })
+        }
+    }
+    return @($out | Sort-Object KdRank, InterfaceIndex)
+}
+
+function Write-KdOutcome {
+    # WHAT THIS RUN DID - the closing summary for a tool that changes a PC in
+    # several steps, so a run that stopped half way still says which half.
+    # $Steps is an [ordered] hashtable of step -> state, where a value starting
+    # DONE or FAILED is coloured; anything else reads as "not reached".
+    #
+    # newpc and domain-join each had their own copy, identical but for the
+    # column width - so the same run reported through two tools lined up
+    # differently for no reason anyone chose.
+    param($Steps, [string]$Because, [string]$Title = 'WHAT THIS RUN DID')
+    Write-Head $Title
+    foreach ($k in $Steps.Keys) {
+        $v = $Steps[$k]
+        $c = if    ($v -like 'DONE*')   { 'Green' }
+             elseif ($v -like 'FAILED*') { 'Red'   }
+             else                        { 'DarkGray' }
+        Write-Host ("    {0,-14}: {1}" -f $k, $v) -ForegroundColor $c
+    }
+    if ($Because) {
+        Write-Host ''
+        Write-Host "  Stopped because: $Because" -ForegroundColor Yellow
+    }
+    Write-Host ''
+    # The summary already knows whether the run failed; tell the menu too,
+    # so the usage log does not file a stopped run as finished.
+    if ($Because) { Set-KdRunFailed $Because }
+    else {
+        foreach ($k in $Steps.Keys) { if ("$($Steps[$k])" -like 'FAILED*') { Set-KdRunFailed "$k - $($Steps[$k])"; break } }
+    }
+}
+
+function Get-KdPenFolder([string]$SubFolder) {
+    # The toolkit folder on the pen, wherever the pen turned up - or $null when
+    # it is not plugged in, which is not an error and callers treat as "skip".
+    #
+    # This loop was written out by hand in nearly thirty tools. Three of them
+    # had grown it into a Find-PenFolder of their own, no two quite alike, and
+    # every one of them carried a comment asking the next person to keep it in
+    # step with the others. It is one function now.
+    #
+    # DriveType 2 = removable (a USB stick), checked first. DriveType 3 = fixed,
+    # checked second because some USB3 sticks and dock-mounted drives report
+    # themselves that way and would otherwise never be found.
+    if (-not $Site -or -not $Site.PenMarker) { return $null }
+    foreach ($dt in 2, 3) {
+        foreach ($d in @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=$dt" -ErrorAction SilentlyContinue)) {
+            $marker = Join-Path "$($d.DeviceID)\" $Site.PenMarker
+            if (Test-Path $marker -ErrorAction SilentlyContinue) {
+                if ($SubFolder) { return (Join-Path $marker $SubFolder) }
+                return $marker
+            }
+        }
+    }
+    return $null
+}
+
+function Get-KdSignedInDocuments {
+    # The Documents folder of the person SIGNED IN at this screen - not of the
+    # account this process runs as. Elevate as kd or an admin and the two
+    # part: GetFolderPath answers for the elevated account, and a page saved
+    # there sits in a profile the person at the desk cannot open.
+    #
+    # The elevated window shares its SESSION with that person's desktop, so
+    # the owner of explorer.exe in this session is who they are - true at the
+    # console and over Remote Desktop alike (Win32_ComputerSystem.UserName is
+    # blank over RDP). Their Documents path is read from THEIR hive, so a
+    # redirected or OneDrive-backed folder is honoured. Returns
+    # @{ Account; Path }, or $null when this process IS that person or the
+    # folder could not be worked out - the caller then uses its own.
+    try {
+        $session = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+        $shell = @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe' AND SessionId=$session" -ErrorAction Stop)[0]
+        if (-not $shell) { return $null }
+        $own = Invoke-CimMethod -InputObject $shell -MethodName GetOwner -ErrorAction Stop
+        if (-not $own.User) { return $null }
+        $account = "$($own.Domain)\$($own.User)"
+        if ($account -ieq (Get-KdWhoAmI)) { return $null }
+        $sid = (New-Object Security.Principal.NTAccount($own.Domain, $own.User)).Translate([Security.Principal.SecurityIdentifier]).Value
+        $profileDir = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction Stop).ProfileImagePath
+        if (-not $profileDir) { return $null }
+        $docs = ''
+        $usf = Get-Item "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction SilentlyContinue
+        if ($usf) { $docs = "$($usf.GetValue('Personal', '', 'DoNotExpandEnvironmentNames'))" }
+        # The value is written against THEIR environment (%USERPROFILE%), which
+        # this process does not have - so it is expanded by hand.
+        if ($docs) { $docs = $docs -ireplace '%USERPROFILE%', $profileDir.Replace('$', '$$') }
+        if (-not $docs -or $docs -match '%') { $docs = Join-Path $profileDir 'Documents' }
+        if (-not (Test-Path $docs -ErrorAction SilentlyContinue)) { return $null }
+        return [pscustomobject]@{ Account = $account; Path = $docs }
+    } catch { return $null }
+}
+
+function Get-KdLocalReportDir([string]$Tool, [switch]$SignedInUser) {
+    # Documents\Reports\<tool> - where a tool's LOCAL copy of its output goes.
+    #
+    # NOT the Desktop, which is where every one of these tools used to write.
+    # A single field visit leaves several files behind (one sysinfo per PC, a
+    # gateway capture per incident, an AD export folder per run) and on the
+    # Desktop that pile is permanent, in somebody's face, and impossible to
+    # tell apart from the person's own files. Documents is where filed work
+    # belongs; the per-tool subfolder keeps one tool's output from being
+    # mistaken for another's.
+    #
+    # GetFolderPath rather than a hardcoded path, so a redirected or
+    # OneDrive-backed Documents is honoured - the same rule the worklog store
+    # follows. Falls back to the profile, then TEMP, so a caller always gets
+    # somewhere writable back.
+    #
+    # -SignedInUser: for output that is SHOWN to the person at the desk (the
+    # fleet page - the share copy sits where only IT can read). Their
+    # Documents, not the elevated account's; falls through to the usual
+    # folder when that cannot be found or written.
+    if ($SignedInUser) {
+        $theirs = Get-KdSignedInDocuments
+        if ($theirs) {
+            $dir = Join-Path $theirs.Path 'Reports'
+            if ($Tool) { $dir = Join-Path $dir $Tool }
+            try {
+                if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null }
+                return $dir
+            } catch { }
+        }
+    }
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    if (-not $docs -and $env:USERPROFILE) { $docs = Join-Path $env:USERPROFILE 'Documents' }
+    $dir = if ($docs) { Join-Path $docs 'Reports' } else { $env:TEMP }
+    if ($Tool) { $dir = Join-Path $dir $Tool }
+    try {
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null }
+    } catch { $dir = $env:TEMP }
+    return $dir
+}
+
+function Move-KdDesktopReports([string]$Tool, [string]$Pattern) {
+    # Carry reports an older build left on the Desktop into the folder above,
+    # so the change of address also cleans up after itself instead of leaving
+    # the old pile for someone to sort out by hand.
+    #
+    # MOVE, not copy: two copies of the same report is worse than one in the
+    # wrong place - you cannot tell which is current. Only names matching
+    # $Pattern move, and each tool passes a pattern tight enough that a
+    # person's own file cannot match it. A name that already exists in the new
+    # folder is left where it is rather than overwritten. Silent on every
+    # failure - tidying must never break a tool.
+    $desk = [Environment]::GetFolderPath('Desktop')
+    if (-not $desk -or -not (Test-Path $desk -ErrorAction SilentlyContinue)) { return }
+    $old = @(Get-ChildItem $desk -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Pattern })
+    if (-not $old.Count) { return }
+    $dir = Get-KdLocalReportDir $Tool
+    # Documents was unreachable and we fell back to TEMP - leave the Desktop
+    # copies alone rather than moving them somewhere Windows will clear out.
+    if (-not $dir -or $dir -eq $env:TEMP) { return }
+    $moved = 0
+    foreach ($f in $old) {
+        $dest = Join-Path $dir $f.Name
+        if (Test-Path $dest) { continue }
+        try { Move-Item $f.FullName $dest -ErrorAction Stop; $moved++ } catch { }
+    }
+    if ($moved) {
+        Write-Host ("Tidied       : moved {0} report(s) off the Desktop into {1}" -f $moved, $dir) -ForegroundColor DarkGray
+    }
+}
+
+
+# =============================================================================
+#  NETWORK CREDENTIALS  -  shared by every tool that reaches another PC
+# =============================================================================
+#  Connecting a printer, reading a PC's shares, staging a driver, pulling an
+#  inventory - all of it authenticates through Credential Manager, and all of
+#  it fails the same way when an entry goes stale. So the handling lives HERE,
+#  once, and every tool gets the same behaviour.
+#
+#  The failure worth knowing: a REFUSED query returns an EMPTY list, not an
+#  error. Windows then reports that the host shares nothing, which reads like
+#  a firewall or an update problem and is neither. After a domain password
+#  change every stored entry goes stale at once, so shares and printers appear
+#  to vanish office-wide - usually landing near a patch Tuesday and taking the
+#  blame for it.
+#
+#  Parsing is of cmdkey's ENGLISH output. On a localised Windows the list comes
+#  back empty rather than wrong, which is the safe way to fail.
+# =============================================================================
+
+function Expand-CredTargets {
+    # A host has TWO credential targets - its name and its IP - and Windows
+    # keeps them separate, so a credential stored against one is not found
+    # when a service reaches the host by the other. Storing only half is the
+    # classic "works from here but not from there". Every writer goes through
+    # this, so the two can never drift apart.
+    param([string]$Server)
+    $targets = @($Server)
+    try {
+        if ($Server -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            $n = ([System.Net.Dns]::GetHostEntry($Server)).HostName
+            if ($n) { $targets += ($n -split '\.')[0] }
+        } else {
+            $ip = ([System.Net.Dns]::GetHostAddresses($Server) |
+                   Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1).IPAddressToString
+            if ($ip) { $targets += $ip }
+        }
+    } catch { }
+    return @($targets | Select-Object -Unique)
+}
+
+function Get-StoredCredentialList {
+    # Parse cmdkey /list into objects. Kind decides whether an entry is safe to
+    # touch: 'host' entries are what file and print access ride on, 'rdp' is
+    # Remote Desktop only, 'other' is application sign-in state.
+    $raw = & cmdkey.exe /list 2>&1
+    $creds = @(); $cur = $null
+    foreach ($ln in $raw) {
+        $s = "$ln"
+        if ($s -match '^\s*Target:\s*(.+?)\s*$') {
+            if ($cur) { $creds += $cur }
+            $cur = [pscustomobject]@{ Target = $matches[1]; User = ''; Short = ''; Kind = '' }
+        }
+        elseif ($cur -and $s -match '^\s*User:\s*(.+?)\s*$') { $cur.User = $matches[1] }
+    }
+    if ($cur) { $creds += $cur }
+
+    foreach ($c in $creds) {
+        # 'Domain:target=SERVER01' -> 'SERVER01'; the short form is what a
+        # technician recognises, and it is the fallback for /delete.
+        $c.Short = if ($c.Target -match 'target=(.+)$') { $matches[1] } else { $c.Target }
+        $c.Kind  = if ($c.Short -like 'TERMSRV/*')            { 'rdp'   }
+                   elseif ($c.Target -like 'Domain:target=*') { 'host'  }
+                   else                                       { 'other' }
+    }
+    # Host entries first - those are the ones that break network access.
+    return @($creds | Sort-Object @{ e = { @{ host = 0; rdp = 1; other = 2 }[$_.Kind] } }, Short)
+}
+
+function Get-KdWhoAmI {
+    # WHO THIS PROCESS ACTUALLY IS - from the token, not from $env:USERNAME.
+    #
+    # The environment block lies. Elevate a terminal as a DIFFERENT account
+    # (the over-the-shoulder UAC prompt a standard user gets) and the new
+    # process carries that account's TOKEN but the environment of the service
+    # that created it: $env:USERNAME comes back 'SYSTEM' while the process is
+    # really the account named at that prompt. A tool that trusts the environment announces the
+    # wrong identity, decides it cannot see the network, and asks for a
+    # credential it already has - which is how a working session gets a wrong
+    # password stored on top of it. Read the token instead.
+    try { return [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { return "$env:USERDOMAIN\$env:USERNAME" }
+}
+
+function Test-KdDomainIdentity {
+    # $true when this process runs as a DOMAIN user - one whose own Kerberos
+    # identity reaches other PCs on its own. False for SYSTEM, a service, the
+    # machine account (name ends in $) and any local account, all of which
+    # need an explicit credential to reach anything.
+    $me = Get-KdWhoAmI
+    if ($me -match '^NT AUTHORITY\\' -or $me -match '\$$') { return $false }
+    $dom = ($me -split '\\')[0]
+    if (-not $dom -or $dom -ieq $env:COMPUTERNAME) { return $false }
+    if ($Site -and $Site.Domain) { return ($dom -ieq ($Site.Domain -split '\.')[0]) }
+    return $true
+}
+
+function Show-CredentialIdentity {
+    # WHOSE vault is this? cmdkey is PER-USER, and most of these tools demand
+    # elevation. A technician who elevated with their own account is shown
+    # THEIR credentials while diagnosing someone else's PC - and the staff
+    # user's stale entry, the one actually breaking things, never appears.
+    # Silence here means diagnosing the wrong profile, so say it out loud.
+    $me = Get-KdWhoAmI
+    Write-Host ''
+    Write-Host ("  Vault of  : {0}" -f $me) -ForegroundColor White
+    if ($global:KdCreds -and $global:KdCreds['last']) {
+        Write-Host ("  Acting as : {0}  (held for this window)" -f $global:KdCreds['last'].UserName) -ForegroundColor White
+    }
+    $console = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    if ($console -and $console -ne $me) {
+        Write-Host "  !   The person signed in at this PC is $console - a DIFFERENT vault." -ForegroundColor Yellow
+        Write-Host '  !   Their access runs on THEIR stored credential, not the one listed here.' -ForegroundColor Yellow
+        Write-Host '  !   To see theirs, run  cmdkey /list  as them, without elevation.' -ForegroundColor Yellow
+    }
+}
+
+function Show-CredentialList {
+    # Print the numbered table and hand the list back, so a caller can select
+    # from exactly what was shown. Returns $null when there is nothing.
+    $creds = @(Get-StoredCredentialList)
+    if (-not $creds) {
+        Write-Host '  !   No saved credentials found (or cmdkey output is not English).' -ForegroundColor Yellow
+        return $null
+    }
+    Write-Host ''
+    Write-Host ('   {0,-3} {1,-42} {2,-24} {3}' -f '#', 'Target', 'User', 'note') -ForegroundColor White
+    for ($i = 0; $i -lt $creds.Count; $i++) {
+        $c = $creds[$i]
+        $note = switch ($c.Kind) {
+            'rdp'   { 'Remote Desktop only - NOT used for file/print access' }
+            'other' { 'app / sign-in - leave alone' }
+            default {
+                # A domain host refuses a bare username outright. Worth
+                # shouting about: it looks harmless and is a certain failure.
+                if ($c.User -and $c.User -notmatch '[\\@]') { '!! no domain prefix - this host WILL refuse it' } else { '' }
+            }
+        }
+        $colour = switch ($c.Kind) { 'host' { if ($note) { 'Yellow' } else { 'Gray' } } 'rdp' { 'DarkGray' } default { 'DarkGray' } }
+        Write-Host ('   {0,-3} {1,-42} {2,-24} {3}' -f "$($i + 1).", $c.Short, $c.User, $note) -ForegroundColor $colour
+    }
+    return $creds
+}
+
+function Set-HostCredential {
+    # Store one credential against BOTH of a host's targets. Any existing
+    # session to the host is dropped first so the new credential is the one
+    # actually used. The entry PERSISTS deliberately: a service acting for the
+    # user outside the logon session - the Print Spooler sending a job to a
+    # \\host\share port, for one - reads it from here long after a tool exits.
+    param([string]$Server, [System.Management.Automation.PSCredential]$Credential)
+    if (-not $Credential) { return $false }
+    $user = $Credential.UserName
+    # NOT $pwd - that is PowerShell's automatic variable for the current path.
+    $pass = $Credential.GetNetworkCredential().Password
+    $ok = $false
+    foreach ($t in (Expand-CredTargets -Server $Server)) {
+        # 2>&1 | Out-Null (not 2>$null): PowerShell 5.1 still surfaces a native
+        # command's stderr as an error record with plain 2>$null.
+        & net.exe use "\\$t\IPC$" /delete /y 2>&1 | Out-Null
+        & cmdkey.exe "/add:$t" "/user:$user" "/pass:$pass" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $ok = $true }
+    }
+    return $ok
+}
+
+function Remove-StoredCredential {
+    # List, pick, confirm, delete. Deleting is how a stale entry gets fixed:
+    # it forces the next connection to store a fresh one.
+    $creds = Show-CredentialList
+    if (-not $creds) { return }
+    Write-Host ''
+    Write-Host '  Delete an entry only to force it to be re-created with the current' -ForegroundColor DarkGray
+    Write-Host '  password. Remove BOTH the host name AND its IP - Windows stores them' -ForegroundColor DarkGray
+    Write-Host '  as separate targets, so half a fix leaves access broken one way.' -ForegroundColor DarkGray
+    Write-Host ''
+    $sel = Read-Host '  Delete which? (numbers, comma-separated, Enter = cancel)'
+    if (-not $sel -or -not $sel.Trim()) { Write-Host '  ->  Nothing deleted.' -ForegroundColor Gray; return }
+
+    $picked = @()
+    foreach ($n in ($sel -split '[,\s]+' | Where-Object { $_ })) {
+        if ($n -notmatch '^\d+$') { Write-Host "  !   not a number: '$n'" -ForegroundColor Yellow; continue }
+        $i = [int]$n
+        if ($i -lt 1 -or $i -gt $creds.Count) { Write-Host "  !   no entry numbered $i" -ForegroundColor Yellow; continue }
+        $picked += $creds[$i - 1]
+    }
+    $picked = @($picked | Sort-Object Target -Unique)
+    if (-not $picked) { Write-Host '  ->  Nothing deleted.' -ForegroundColor Gray; return }
+
+    Write-Host ''
+    Write-Host '  !   These will be REMOVED from Credential Manager:' -ForegroundColor Yellow
+    foreach ($p in $picked) {
+        Write-Host ("    {0,-42} {1}" -f $p.Short, $p.User) -ForegroundColor Yellow
+        if ($p.Kind -ne 'host') { Write-Host "  !     ^ a '$($p.Kind)' entry, not a network one - are you sure?" -ForegroundColor Yellow }
+    }
+    if ((Read-Host '  Type YES to confirm') -ne 'YES') { Write-Host '  ->  Cancelled - nothing deleted.' -ForegroundColor Gray; return }
+
+    $removed = @()
+    foreach ($p in $picked) {
+        # Try the full 'Domain:target=X' form first, then the bare short form -
+        # which of the two cmdkey accepts varies with the credential type.
+        $out = & cmdkey.exe "/delete:$($p.Target)" 2>&1
+        if ($LASTEXITCODE -ne 0) { $out = & cmdkey.exe "/delete:$($p.Short)" 2>&1 }
+        if ($LASTEXITCODE -eq 0) { Write-Host "  OK  removed  $($p.Short)" -ForegroundColor Green; $removed += $p }
+        else { Write-Host "  X   could not remove $($p.Short): $(@($out)[-1])" -ForegroundColor Red }
+    }
+    return $removed
+}
+
+# ---------------------------------------------------------------------------
+#  SESSION CREDENTIALS  -  type an account once, reuse it across tools
+# ---------------------------------------------------------------------------
+#  Tools launched from a menu run inside ONE PowerShell process, so an account
+#  typed for sysinfo's share upload is still in memory when printer needs it.
+#  $global:KdCreds holds them, keyed by purpose ('the domain', 'the file
+#  server', 'the directory', 'network access') plus 'last' = whatever was
+#  typed most recently. Memory only: never written anywhere, gone when the
+#  window closes, and forgettable from the credential menu.
+#
+#  Asked ONCE PER TOOL RUN. The first time a tool needs a purpose it offers the
+#  held account with a (y/n); after a yes the rest of that run reuses it
+#  silently, and the next tool asks again. $script:KdCredRun is that per-run
+#  memory - reset right here, at block load, which is the start of every tool.
+#
+#  Tools call THIS, never Get-Credential directly. A refused account is
+#  dropped with Forget-KdCredential so a typo is not offered back.
+$script:KdCredRun = @{}
+if (-not $global:KdCreds) { $global:KdCreds = @{} }
+
+function Get-KdCredential {
+    param(
+        [string]$Purpose,       # 'the domain' / 'the file server' / 'the directory' / 'network access'
+        [string]$Message,       # dialog text; default "Account for <purpose>"
+        [string]$Hint,          # example account, appended as (e.g. ...)
+        [string[]]$Note,        # lines shown ONLY when a new account is about to be typed
+        [switch]$Failed         # the held one was refused: forget it and ask afresh
+    )
+    if ($Failed) { Forget-KdCredential -Purpose $Purpose }
+    $held = $global:KdCreds[$Purpose]
+    if (-not $held) { $held = $global:KdCreds['last'] }
+    if ($held) {
+        if ($script:KdCredRun[$Purpose]) { return $held }
+        if ((Read-Host "  Use $($held.UserName) again for ${Purpose}? (y/n)") -match '^[Yy]') {
+            $global:KdCreds[$Purpose]   = $held
+            $script:KdCredRun[$Purpose] = $true
+            return $held
+        }
+    }
+    foreach ($n in $Note) { Write-Host "  $n" -ForegroundColor Gray }
+    $msg = if ($Message) { $Message } else { "Account for $Purpose" }
+    if ($Hint) { $msg += " (e.g. $Hint)" }
+    $c = Get-Credential -Message $msg
+    if (-not $c) { return $null }
+    $global:KdCreds[$Purpose]   = $c
+    $global:KdCreds['last']     = $c
+    $script:KdCredRun[$Purpose] = $true
+    return $c
+}
+
+function Get-KdHeldCredential {
+    # The account already typed this window, WITHOUT asking for one.
+    #
+    # Get-KdCredential is the way in when a tool needs a credential and may
+    # prompt for it. This is for the other case: a sweep that can carry on
+    # regardless, and must not stop in the middle of sixty queries to put up a
+    # dialog. Returns $null when nothing is held, which callers treat as
+    # "ask cold and report what comes back".
+    #
+    # It exists so tools stop reaching into $global:KdCreds themselves - the
+    # store's shape is this file's business, and a tool that pokes at it
+    # breaks silently the day the shape changes.
+    param([string]$Purpose)
+    if (-not $global:KdCreds) { return $null }
+    if ($Purpose -and $global:KdCreds[$Purpose]) { return $global:KdCreds[$Purpose] }
+    return $global:KdCreds['last']
+}
+
+function Forget-KdCredential {
+    # Drop a held account - the domain refused it, or the technician asked.
+    # No purpose = forget everything (menu option, launcher exit).
+    param([string]$Purpose)
+    if (-not $global:KdCreds) { $global:KdCreds = @{} }
+    if (-not $Purpose) { $global:KdCreds = @{}; $script:KdCredRun = @{}; return }
+    $gone = $global:KdCreds[$Purpose]
+    $global:KdCreds.Remove($Purpose)
+    if ($gone -and [object]::ReferenceEquals($global:KdCreds['last'], $gone)) { $global:KdCreds.Remove('last') }
+    $script:KdCredRun.Remove($Purpose)
+}
+
+function Forget-KdCredentialIfRefused {
+    # For a catch block: forget the account only when the error reads like an
+    # authentication failure. A missing folder or an unreachable host is not
+    # the account's fault, and retyping it would fix nothing.
+    param([string]$Purpose, $Because)
+    if ("$Because" -match 'denied|password|logon|credential|user ?name|unknown user|1326|0x8007052e') {
+        Forget-KdCredential -Purpose $Purpose
+        Write-Host '  ->  That account was refused - it will not be offered again.' -ForegroundColor DarkGray
+    }
+}
+
+function Show-HostConnection {
+    # What THIS PC is holding for one host - the stored credential and any
+    # live session - against BOTH of the host's targets, because Windows
+    # keeps the name and the IP apart and a technician looking at one will
+    # not see the other. Read-only; returns $true if anything is held.
+    param([string]$Server)
+    if (-not $Server) { return $false }
+    $targets = @(Expand-CredTargets -Server $Server)
+    Write-Host ("  Held on this PC for {0}:" -f ($targets -join '  +  ')) -ForegroundColor White
+    $any = $false
+    foreach ($c in @(Get-StoredCredentialList)) {
+        foreach ($t in $targets) {
+            if ($c.Short -ieq $t) {
+                Write-Host ("    credential   {0,-24} as {1}" -f $c.Short, $c.User) -ForegroundColor Gray
+                $any = $true
+            }
+        }
+    }
+    foreach ($ln in @(& net.exe use 2>&1 | ForEach-Object { "$_" })) {
+        $l = $ln
+        if (@($targets | Where-Object { $l -like "*\\$_\*" -or $l -like "*\\$_ *" }).Count) {
+            Write-Host ("    session      {0}" -f $l.Trim()) -ForegroundColor Gray
+            $any = $true
+        }
+    }
+    if (-not $any) { Write-Host '    nothing - this PC reaches it as whoever is signed in.' -ForegroundColor DarkGray }
+    return $any
+}
+
+function Clear-HostConnection {
+    # Drop everything this PC holds for one host: the live session first,
+    # then the stored credential, for BOTH targets.
+    #
+    # This is the fix for the two faults that make a perfectly healthy PC
+    # look as though it shares nothing:
+    #   1326 - a stored entry whose password is stale. It OVERRIDES the
+    #          identity the session would have used, so the better
+    #          credential never gets a turn.
+    #   1219 - a session already open to that host as a different account.
+    #          Windows permits exactly one at a time and refuses the second
+    #          however correct it is - the usual cause being a tool running
+    #          elevated as the admin while the desk user is signed in.
+    # Neither is a firewall, and neither is fixed by retyping the password.
+    # Nothing here touches the OTHER PC, only what this one remembers.
+    param([string]$Server)
+    if (-not $Server) { return @() }
+    $done = @()
+    foreach ($t in @(Expand-CredTargets -Server $Server)) {
+        & net.exe use "\\$t\IPC$" /delete /y 2>&1 | Out-Null
+        & cmdkey.exe "/delete:$t" 2>&1 | Out-Null
+        & cmdkey.exe "/delete:Domain:target=$t" 2>&1 | Out-Null
+        $done += $t
+    }
+    return $done
+}
+
+function Clear-HostConnectionPrompt {
+    # The menu form: ask for a host, show what is held, clear on a yes.
+    param([string]$Server)
+    Write-Host ''
+    $target = if ($Server) { $Server } else { (Read-Host '  Host name or IP to clear (Enter = cancel)').Trim() }
+    if (-not $target) { Write-Host '  ->  Cancelled.' -ForegroundColor Gray; return $false }
+    $held = Show-HostConnection -Server $target
+    if (-not $held) { return $false }
+    Write-Host ''
+    if ((Read-Host "  Drop all of that for $target? (y/n)") -notmatch '^[Yy]') {
+        Write-Host '  ->  Left as it is.' -ForegroundColor Gray
+        return $false
+    }
+    $done = @(Clear-HostConnection -Server $target)
+    Write-Host ("  OK  Cleared for {0}. This PC now reaches it as whoever is signed in." -f ($done -join ' + ')) -ForegroundColor Green
+    return $true
+}
+
+function Add-HostCredentialPrompt {
+    # Ask for a host and an account, then store it for both of the host's
+    # targets. Separate from the menu so a tool can offer "fix this host's
+    # credential" straight from wherever the failure surfaced.
+    param([string]$Server)
+    Write-Host ''
+    $target = if ($Server) { $Server } else { (Read-Host '  Host name or IP to store a credential for (Enter = cancel)').Trim() }
+    if (-not $target) { Write-Host '  ->  Cancelled.' -ForegroundColor Gray; return $false }
+    Write-Host ("  ->  Will store against: {0}" -f ((Expand-CredTargets -Server $target) -join '  +  ')) -ForegroundColor Gray
+    $cred = Get-KdCredential -Purpose 'network access' -Message "Account to store for \\$target"
+    if (-not $cred) { Write-Host '  ->  Cancelled.' -ForegroundColor Gray; return $false }
+    if (Set-HostCredential -Server $target -Credential $cred) {
+        Write-Host "  OK  Stored for \\$target ($($cred.UserName))." -ForegroundColor Green
+        return $true
+    }
+    Write-Host "  X   Could not store a credential for \\$target." -ForegroundColor Red
+    return $false
+}
+
+function Invoke-CredentialMenu {
+    # The one credential screen, shared by every tool. A tool that carries a
+    # SESSION identity of its own (printer does) passes -SignIn, so signing in
+    # here updates that tool's state too rather than only the stored entry;
+    # a tool without one simply does not show the option. -Status lets a tool
+    # print its own header line above the list (printer shows "Acting as").
+    param(
+        [scriptblock]$SignIn,
+        [string]$SignInLabel = 'Sign in  (set the account this session uses everywhere)',
+        [scriptblock]$Status
+    )
+    while ($true) {
+        if ($Status) { & $Status }
+        Show-CredentialIdentity
+        Write-Host ''
+        Write-Host '  Network credentials' -ForegroundColor White
+        Write-Host '   1.  List saved credentials'
+        Write-Host '   2.  Add / update a credential for a host'
+        if ($SignIn) { Write-Host "   3.  $SignInLabel" }
+        Write-Host '   4.  Delete saved credentials'
+        Write-Host '   5.  Forget the accounts held for this window'
+        Write-Host '   6.  Clear ONE host  (drop its session + stored credential)'
+        Write-Host '   0.  back'
+        $c = Read-Host '  Choose'
+        switch ($c) {
+            '1' { $null = Show-CredentialList }
+            '2' { $null = Add-HostCredentialPrompt }
+            '3' { if ($SignIn) { & $SignIn } else { Write-Host "  !   Invalid choice: '$c'" -ForegroundColor Yellow } }
+            '4' { $null = Remove-StoredCredential }
+            '5' { Forget-KdCredential; Write-Host '  ->  Forgotten. The next tool asks for an account again.' -ForegroundColor Gray }
+            '6' { $null = Clear-HostConnectionPrompt }
+            '0' { return }
+            ''  { return }
+            default { Write-Host "  !   Invalid choice: '$c'" -ForegroundColor Yellow }
+        }
+    }
+}
+
+
+# =============================================================================
+#  ASKING ANOTHER PC WHAT IT SHARES  -  the primitives, in one place
+# =============================================================================
+#  printer (connect + the office sweep), fleet (the shared-printer page) and
+#  printer-info all ask the same question of another PC, and each grew its own
+#  answer. They drifted, and the drift was not cosmetic: three faults fixed in
+#  one tool went on biting in the others, each one turning a printer that
+#  exists into a printer nobody can find.
+#
+#    - a REFUSED question was reported as "shares nothing" (see below),
+#    - the question was asked with no identity the office accepts, so every
+#      domain PC refused a workgroup PC while that same PC could still connect
+#      to a printer perfectly well,
+#    - reachability was decided by PING, which policy blocks on plenty of
+#      desks that have file sharing wide open.
+#
+#  So they live here now, once. A tool keeps its own orchestration - which PCs
+#  to ask, and what to do with the answer - and shares the asking.
+# =============================================================================
+
+function Connect-KdQuerySession {
+    # A TRANSIENT session to one host, for a read-only question.
+    #
+    # Deliberately NOT Set-HostCredential: that writes the account into
+    # Credential Manager and leaves it there, which is right for a printer this
+    # PC will keep printing to (the spooler reads it long after the tool exits)
+    # and wrong for a sweep - it would deposit an admin credential for every PC
+    # in the office on whichever desk the sweep was run from.
+    param([string]$Target, [System.Management.Automation.PSCredential]$Credential)
+    if (-not $Credential -or -not $Target) { return $false }
+    $user = $Credential.UserName
+    $pass = $Credential.GetNetworkCredential().Password
+    # 2>&1 | Out-Null, not 2>$null: 5.1 surfaces a native command's stderr as an
+    # error record with the latter.
+    $out = & net.exe use "\\$Target\IPC$" $pass "/user:$user" 2>&1 | ForEach-Object { "$_" }
+    if ($LASTEXITCODE -eq 0) { return $true }
+    # 1219 - this PC already holds a session to that host as a DIFFERENT
+    # account, and Windows permits exactly one. The existing one is not working
+    # (we are only here because the question was refused), so it is dropped and
+    # ours takes its place. Nothing is touched on a host that answered.
+    if (($out -join ' ') -match '1219') {
+        & net.exe use "\\$Target\IPC$" /delete /y 2>&1 | Out-Null
+        & net.exe use "\\$Target\IPC$" $pass "/user:$user" 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    }
+    return $false
+}
+
+function Disconnect-KdQuerySession([string]$Target) {
+    if ($Target) { & net.exe use "\\$Target\IPC$" /delete /y 2>&1 | Out-Null }
+}
+
+function Test-KdHostsReachable {
+    # Which of these PCs can be ASKED, decided on port 445 rather than a ping.
+    #
+    # 445 is the port the question itself travels over, so it is the honest
+    # test; ICMP is blocked by policy on plenty of desks whose file sharing is
+    # wide open, and a PC skipped for not answering a ping is a printer missing
+    # from a list for no reason. The ping still goes out alongside, only to
+    # tell "off" apart from "on, but not sharing".
+    #
+    # Takes objects carrying PC and IP; returns a hashtable keyed by PC name:
+    #   smb   - reachable, ask it
+    #   nosmb - answers a ping, file sharing shut
+    #   off   - nothing at all
+    param($Targets, [int]$TimeoutMs = 1500)
+    $out = @{}
+    $t = @($Targets | Where-Object { $_.PC -and $_.IP })
+    if (-not $t.Count) { return $out }
+    $pings = @{}; $ports = @{}
+    foreach ($x in $t) {
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        $pings[$x.PC] = $ping.SendPingAsync($x.IP, $TimeoutMs)
+        $client = New-Object System.Net.Sockets.TcpClient
+        $ports[$x.PC] = [pscustomobject]@{ Client = $client; Task = $client.ConnectAsync($x.IP, 445) }
+    }
+    # WaitAll THROWS when any task faults, and a refused TCP connect faults - so
+    # the wait is only a wait, and each task is judged on its own below.
+    try { [System.Threading.Tasks.Task]::WaitAll(@($pings.Values), ($TimeoutMs * 3)) | Out-Null } catch { }
+    try { [System.Threading.Tasks.Task]::WaitAll(@($ports.Values | ForEach-Object { $_.Task }), ($TimeoutMs * 3)) | Out-Null } catch { }
+    foreach ($x in $t) {
+        $pg = $pings[$x.PC]
+        $pingOk = [bool]($pg -and $pg.Status -eq 'RanToCompletion' -and $pg.Result.Status -eq 'Success')
+        $smbOk  = [bool]($ports[$x.PC].Task.Status -eq 'RanToCompletion')
+        $out[$x.PC] = if ($smbOk)      { [pscustomobject]@{ State = 'smb';   Why = '' } }
+                      elseif ($pingOk) { [pscustomobject]@{ State = 'nosmb'; Why = 'it answers a ping but not file sharing (port 445 shut)' } }
+                      else             { [pscustomobject]@{ State = 'off';   Why = 'no answer at all - the PC is off or unreachable' } }
+    }
+    foreach ($x in $ports.Values) { try { $x.Client.Close() } catch { } }
+    return $out
+}
+
+function Get-KdHostPrinters {
+    # What one PC shares, and - when it will not say - WHY, in
+    # $script:KdShareError for the caller to report honestly. "The PC shares
+    # nothing" and "the PC would not tell me" are both zero rows from here, and
+    # saying the first when it is the second sends the technician to the wrong
+    # PC entirely.
+    #
+    # Pass -Credential to have a refusal retried once over a transient session:
+    # asking a PC what it shares is an ADMINISTRATIVE question, and a session
+    # with no identity those PCs accept is refused by every one of them.
+    param([string]$Target, [System.Management.Automation.PSCredential]$Credential)
+    $script:KdShareError = ''
+    $found = @()
+    if (-not $Target) { return $found }
+
+    $ask = {
+        param([string]$t)
+        $rows = @()
+        # Best: ask the remote print spooler directly - it gives the share name
+        # AND the driver. Needs rights on the far PC, so it is the first choice
+        # and not the only one.
+        try {
+            foreach ($p in @(Get-Printer -ComputerName $t -ErrorAction Stop | Where-Object { $_.Shared -and $_.ShareName })) {
+                $rows += [pscustomobject]@{ Share = "$($p.ShareName)"; Name = "$($p.Name)"; Driver = "$($p.DriverName)" }
+            }
+            if ($rows.Count) { return $rows }
+        } catch {
+            $script:KdShareError = "the remote spooler refused the query ($($_.Exception.Message.Trim()))"
+        }
+
+        # Fallback: enumerate the PC's shares over SMB and keep the Print ones.
+        # Needs only share-list access, so it works far more widely - and on
+        # most desks this, not the spooler, is the path that answers.
+        $lines = & net.exe view "\\$t" /all 2>&1
+        $text  = ($lines | ForEach-Object { "$_" }) -join "`n"
+        if ($text -match 'System error (\d+)') {
+            # net view names the fault in a way Get-Printer does not, and none
+            # of these is a firewall.
+            $script:KdShareError = switch ($Matches[1]) {
+                '5'    { 'it refused the share list (access denied).' }
+                '53'   { 'it was not found on the network.' }
+                '67'   { 'the network name could not be found.' }
+                '1219' { 'this PC already has a session to it as a DIFFERENT account - Windows allows only one at a time.' }
+                '1326' { 'it rejected the sign-in - WRONG USERNAME OR PASSWORD.' }
+                default { "the share list failed with system error $($Matches[1])." }
+            }
+        }
+        elseif ($text -match 'There are no entries in the list' -or
+                $text -match 'Share name' -or
+                $text -match 'command completed successfully') {
+            # THE LISTING WORKED. Clear the spooler's complaint from above, or
+            # the PC is reported as having REFUSED when it actually answered -
+            # and answered "I share no printer", which is a different fact
+            # needing a different action. Getting this backwards sends the
+            # technician to clear credentials that were never the problem, on a
+            # PC that was never the problem.
+            $script:KdShareError = ''
+        }
+        foreach ($ln in $lines) {
+            # Columns are:  Share name | Type | Used as | Comment
+            #
+            # For a shared printer Windows puts the printer's MODEL in the
+            # comment, and that model is exactly the driver name needed to
+            # build a local queue. Without it the connect can only attempt
+            # Point-and-Print, which a patched Windows refuses over an
+            # IP-based UNC - the share name cannot supply it either, because
+            # Windows strips '/' when it generates a share name from a model.
+            #
+            # It is only a HINT: a comment is free text and anyone can retype
+            # it. The caller confirms the driver is installed or can be staged.
+            if ($ln -match '^(?<share>.+?)\s{2,}Print\s{2,}(?<comment>.*)$') {
+                $s = $Matches.share.Trim()
+                $rows += [pscustomobject]@{ Share = $s; Name = $s; Driver = $Matches.comment.Trim() }
+            }
+        }
+        return $rows
+    }
+
+    $found = @(& $ask $Target)
+    if ($found.Count -or -not $script:KdShareError -or -not $Credential) { return $found }
+
+    # Refused, and we hold an account it may accept: sign in to this one host,
+    # ask once more, and drop the session again.
+    if (Connect-KdQuerySession -Target $Target -Credential $Credential) {
+        $found = @(& $ask $Target)
+        Disconnect-KdQuerySession -Target $Target
+    }
+    return $found
+}
+
+
+# =============================================================================
+#  DHIVEHI KEYBOARD  -  English (US) + Divehi Phonetic, the pair every desk needs
+# =============================================================================
+#  Windows keeps input methods PER USER, not per PC. That is the whole trap
+#  here: a tool run elevated as an admin sets the keyboard for THAT account and
+#  the person at the desk sees no change at all, then reports that the tool did
+#  nothing. So this reports WHO it actually reached, and can reach three
+#  different sets of people - which answer three different questions:
+#
+#    this user      Set-WinUserLanguageList, the supported call. Takes effect
+#                   without signing out.
+#    new users      the Default profile hive, which Windows copies for every
+#                   account created on this PC afterwards.
+#    other users    each existing profile's own hive - the accounts already on
+#                   the PC, who are not the one running the tool.
+#
+#  The keyboard needs no language pack and no download: Divehi Phonetic ships
+#  with Windows as KLID 00000465, so this works on a PC with no internet.
+# =============================================================================
+
+$script:KdKbdEnUs = '00000409'   # US
+$script:KdKbdDv   = '00000465'   # Divehi Phonetic (00010465 is Divehi Typewriter)
+
+function Set-KdPreloadKeyboards {
+    # Write the Preload list into ONE hive: the legacy key, which is what
+    # Windows reads when it builds a profile and the only handle we have on a
+    # user who is not signed in. Existing layouts are kept and the two we want
+    # are ensured, then the whole list is renumbered 1..n - Windows treats a
+    # gap in that numbering as the end of the list and silently drops the rest.
+    param([string]$HiveRoot)
+    $key = Join-Path $HiveRoot 'Keyboard Layout\Preload'
+    try {
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force -ErrorAction Stop | Out-Null }
+        $cur  = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+        $vals = @()
+        if ($cur) {
+            foreach ($n in 1..20) {
+                $v = "$($cur.$n)"
+                if ($v) { $vals += $v }
+            }
+        }
+        if ($vals -notcontains $script:KdKbdEnUs) { $vals = @($script:KdKbdEnUs) + $vals }
+        if ($vals -notcontains $script:KdKbdDv)   { $vals += $script:KdKbdDv }
+        $vals = @($vals | Select-Object -Unique)
+        # Clear first: a shorter new list would otherwise leave the old tail
+        # behind, and that tail is a layout nobody asked for.
+        foreach ($n in 1..20) { Remove-ItemProperty -Path $key -Name "$n" -ErrorAction SilentlyContinue }
+        for ($i = 0; $i -lt $vals.Count; $i++) {
+            New-ItemProperty -Path $key -Name "$($i + 1)" -Value $vals[$i] -PropertyType String -Force -ErrorAction Stop | Out-Null
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Add-KdDhivehiKeyboard {
+    # Returns what actually happened, per audience, so a caller can report it
+    # honestly rather than saying "done" for a PC where one account got it.
+    param([switch]$NewUsers, [switch]$ExistingUsers)
+    $result = [pscustomobject]@{
+        Me = $false; MeName = (Get-KdWhoAmI); NewUsers = $false
+        Others = @(); Failed = @(); AlreadyHad = $false
+    }
+
+    # --- the account running this ------------------------------------------
+    try {
+        $list = Get-WinUserLanguageList -ErrorAction Stop
+        # MATCH ON THE PREFIX. Windows stores Dhivehi as the tag 'dv', not
+        # 'dv-MV' - it normalises a neutral language to its short form the
+        # moment the list is saved. Matching 'dv-MV' exactly therefore never
+        # finds the entry that IS already there, so the tool reports adding a
+        # keyboard the PC has had for a year, and only Windows folding the two
+        # onto the same entry stops it appearing twice. Same for English: a PC
+        # can carry 'en-GB' or a bare 'en'.
+        $dv  = @($list | Where-Object { "$($_.LanguageTag)" -like 'dv*' })[0]
+        $had = [bool]($dv -and $dv.InputMethodTips -contains "0465:$($script:KdKbdDv)")
+        if (-not @($list | Where-Object { "$($_.LanguageTag)" -like 'en*' }).Count) { $list.Add('en-US') }
+        if (-not $dv) {
+            $list.Add('dv-MV')
+            $dv = @($list | Where-Object { "$($_.LanguageTag)" -like 'dv*' })[0]
+        }
+        if ($dv -and $dv.InputMethodTips -notcontains "0465:$($script:KdKbdDv)") {
+            # Phonetic, not Typewriter: it is what this office types on, and a
+            # list carrying both makes the user pick one every time they switch.
+            $dv.InputMethodTips.Clear()
+            $dv.InputMethodTips.Add("0465:$($script:KdKbdDv)")
+        }
+        Set-WinUserLanguageList $list -Force -ErrorAction Stop
+        $result.Me = $true
+        $result.AlreadyHad = $had
+    } catch {
+        $result.Failed += "this account ($($result.MeName)): $($_.Exception.Message)"
+    }
+
+    # --- everyone created from now on --------------------------------------
+    if ($NewUsers) {
+        $hive = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
+        if (Test-Path $hive) {
+            $mount = 'KD_DEFAULT'
+            & reg.exe load "HKU\$mount" $hive 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $result.NewUsers = Set-KdPreloadKeyboards "Registry::HKEY_USERS\$mount"
+                # The hive will not unload while anything still holds a handle,
+                # and PowerShell holds one until the objects behind those reads
+                # are collected. Without this the unload fails and the Default
+                # profile is left mounted for the rest of the session.
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+                & reg.exe unload "HKU\$mount" 2>&1 | Out-Null
+            } else {
+                $result.Failed += 'the Default profile hive would not load (run as Administrator)'
+            }
+        } else {
+            $result.Failed += "no Default profile at $hive"
+        }
+    }
+
+    # --- the other accounts already on this PC ------------------------------
+    if ($ExistingUsers) {
+        $mySid = try { ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value } catch { '' }
+        foreach ($k in @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue)) {
+            $sid = $k.PSChildName
+            if ($sid -notmatch '^S-1-5-21-.+-\d+$') { continue }   # skip SYSTEM and the service accounts
+            if ($sid -eq $mySid) { continue }                      # done above, through the proper API
+            $path = (Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+            $name = if ($path) { Split-Path $path -Leaf } else { $sid }
+            $loaded = Test-Path "Registry::HKEY_USERS\$sid"
+            $mount  = if ($loaded) { $sid } else { "KD_$($sid.Split('-')[-1])" }
+            $ok = $false
+            if ($loaded) {
+                # Signed in right now - write straight into the live hive.
+                $ok = Set-KdPreloadKeyboards "Registry::HKEY_USERS\$sid"
+            }
+            elseif ($path -and (Test-Path (Join-Path $path 'NTUSER.DAT'))) {
+                & reg.exe load "HKU\$mount" (Join-Path $path 'NTUSER.DAT') 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    $ok = Set-KdPreloadKeyboards "Registry::HKEY_USERS\$mount"
+                    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+                    & reg.exe unload "HKU\$mount" 2>&1 | Out-Null
+                }
+            }
+            if ($ok) { $result.Others += $name } else { $result.Failed += "profile $name" }
+        }
+    }
+    return $result
+}
+
+function Show-KdDhivehiKeyboardResult {
+    # One report for both callers, so the setup flow and the standalone option
+    # can never describe the same work differently.
+    param($Result, $DeskUser)
+    if ($Result.Me) {
+        if ($Result.AlreadyHad) { Write-Host "  OK  $($Result.MeName) already had Dhivehi (phonetic) - list confirmed." -ForegroundColor Green }
+        else                    { Write-Host "  OK  Dhivehi (phonetic) added for $($Result.MeName), alongside English (US)." -ForegroundColor Green }
+    }
+    if ($Result.NewUsers) { Write-Host '  OK  Every account created on this PC from now on gets both.' -ForegroundColor Green }
+    if ($Result.Others.Count) {
+        Write-Host ("  OK  Also applied to {0} other profile(s): {1}" -f $Result.Others.Count, ($Result.Others -join ', ')) -ForegroundColor Green
+        Write-Host '      They get it at their next sign-in.' -ForegroundColor DarkGray
+    }
+    # The trap named out loud: the tool ran as one account, the desk belongs to
+    # another, and a keyboard set for the first is invisible to the second.
+    if ($DeskUser -and $Result.MeName -and (($Result.MeName -split '\\')[-1] -notlike $DeskUser)) {
+        if ($Result.Others -notcontains $DeskUser) {
+            Write-Host "  !   This ran as $($Result.MeName), but this desk is $DeskUser's." -ForegroundColor Yellow
+            Write-Host "      A keyboard is per USER, so $DeskUser does not have it yet." -ForegroundColor Yellow
+        }
+    }
+    foreach ($f in $Result.Failed) { Write-Host "  X   Could not apply to $f" -ForegroundColor Red }
+    if ($Result.Me) {
+        Write-Host '      Switch keyboards with the Windows key + Space.' -ForegroundColor DarkGray
+    }
+}
+
+function Find-KdComputerObject {
+    # DOES THE DOMAIN STILL HAVE AN ACCOUNT FOR THIS PC? Asked of the
+    # directory itself over LDAP, from any PC, with no RSAT - the same plain
+    # ADSI the server tools are built on.
+    #
+    # The PC's own opinion is worth nothing here: a PC whose computer object
+    # was deleted in AD still says it is a member of the domain, still shows the
+    # domain at the sign-in screen, and fails every domain operation with a
+    # different message - rename says "the specified computer account could
+    # not be found", the trust check says "broken", a leave with a domain
+    # credential says "no mapping between account names and security IDs".
+    # One fact, three wordings, and a technician trying "a domain
+    # administrator" as the last of them suggests (FC-A1 desk, 2026-09-23).
+    #
+    # Returns @{ State; Dn; Why }: State is 'found', 'missing' or 'refused'.
+    # REFUSED IS NOT MISSING (rule 9): a query that could not be made - no
+    # directory configured, the DC unreachable, this account not accepted -
+    # says so in Why, and the caller decides what to do about not knowing.
+    # $Credential binds explicitly (the technician-on-a-local-account case);
+    # without it the process's own identity is used, which on a broken-trust
+    # PC is fine when that identity is a domain user signed in from cache.
+    param([string]$Name, [System.Management.Automation.PSCredential]$Credential, [string]$Server)
+    $out = @{ State = 'refused'; Dn = ''; Why = '' }
+    if (-not $Name) { $out.Why = 'no PC name given'; return $out }
+    $Name = ($Name -split '\.')[0]
+    $dc = $Server
+    if (-not $dc -and $Site -and $Site.DcHost) { $dc = $Site.DcHost }
+    if (-not $dc -and $Site -and $Site.Domain) { $dc = $Site.Domain }
+    if (-not $dc) { $out.Why = 'no directory configured (a generic build)'; return $out }
+    $path = "LDAP://$dc"
+    if ($Site -and $Site.DomainDn) { $path += "/$($Site.DomainDn)" }
+    # LDAP filter escaping for the few characters a name could carry.
+    $safe = $Name -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29'
+    try {
+        $root = if ($Credential) {
+            New-Object System.DirectoryServices.DirectoryEntry($path, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        } else { New-Object System.DirectoryServices.DirectoryEntry($path) }
+        $s = New-Object System.DirectoryServices.DirectorySearcher($root, "(&(objectCategory=computer)(|(sAMAccountName=$safe`$)(name=$safe)))")
+        $null = $s.PropertiesToLoad.Add('distinguishedName')
+        $r = $s.FindOne()
+        if ($r) {
+            $p = $r.Properties['distinguishedname']
+            $out.State = 'found'
+            $out.Dn = if ($p -and $p.Count) { "$($p[0])" } else { '' }
+        } else {
+            $out.State = 'missing'
+        }
+    } catch {
+        $out.Why = $_.Exception.Message -replace '[\r\n]+', ' '
+    }
+    return $out
+}
 # <#/FUNCTIONS#>
 
+# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
 function Write-Head($text) {
+    # The banner that opens a tool or a stage. 62 wide: the plurality of the
+    # tools already used it, it clears the longest heading in the toolkit, and
+    # it fits an 80-column console with room to spare.
     Write-Host ''
     Write-Host ('=' * 62) -ForegroundColor Cyan
     Write-Host "  $text" -ForegroundColor Cyan
     Write-Host ('=' * 62) -ForegroundColor Cyan
 }
+
+function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
 function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
 function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
 function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
 
+# --- asking, which is as much the house voice as printing ------------------
+#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
+#  two were written out in eight tools between them - identical but for the
+#  parameter name - which is a rule kept by hand, and a rule kept by hand is
+#  one that drifts the first time somebody is in a hurry.
+
+function Confirm-Action($prompt) {
+    # A plain yes/no. Anything not starting with y is no, so Enter is no.
+    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
+}
+
+function Confirm-Default($prompt, $default) {
+    # The same, but Enter takes the default and the prompt SAYS which - never
+    # "[default]" or a bare "(y/n)" that hides it.
+    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
+    $a = (Read-Host "  $prompt ($hint)").Trim()
+    if (-not $a) { return $default }
+    return ($a -match '^[Yy]')
+}
+# <#/VOICE#>
 Write-Head "ASSET NUMBERS  -  $env:COMPUTERNAME"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
@@ -456,7 +1940,7 @@ while ($true) {
 
             $ofc = if ($Site.AssetOffice) { $Site.AssetOffice } else { 'OFC' }
             Write-Host '  Format (from procurement): {office}-{year}-{cat}-{type}-{serial}' -ForegroundColor Gray
-            Write-Host "  e.g. $ofc-2024-03-073-0001   ($ofc = this office's register code; 03 = Equipment)" -ForegroundColor Gray
+            Write-Host "  e.g. $ofc-2015-4-1-356A   ($ofc = this office's register code; the serial may end in one letter)" -ForegroundColor Gray
             $no = (Read-Host "  Asset number for $item").Trim().ToUpper()
             if (-not $no) { Write-Warn 'No number given.'; continue }
             if (-not (Test-AssetNo $no)) {
@@ -483,7 +1967,7 @@ while ($true) {
         '^[Rr]$' {
             $rec = Get-AssetRecords
             if (-not $rec.Count) { Write-Warn 'Nothing recorded to remove.'; continue }
-            $item = (Read-Host '  Remove which item').Trim()
+            $item = (Read-Host '  Item to remove').Trim()
             $match = @($rec.Keys) | Where-Object { $_ -ieq $item } | Select-Object -First 1
             if (-not $match) { Write-Warn "No item named '$item' recorded."; continue }
             Remove-ItemProperty -Path $assetKey -Name $match -ErrorAction SilentlyContinue

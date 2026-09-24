@@ -1,5 +1,5 @@
 # =============================================================================
-#  pc-check.ps1  -  60-second triage: why is this PC slow / is this PC ready?
+#  creds.ps1  -  the network credentials this PC has saved, and how to fix them
 # =============================================================================
 #
 #  AUTHOR
@@ -9,31 +9,94 @@
 #
 #  WHAT IT DOES
 #  ------------
-#  The two questions this answers, read-only, in about a minute:
+#  Shows what is in this PC's Credential Manager, adds an entry for a host,
+#  and deletes the ones that have gone stale. Nothing more - but it is the
+#  thing half the "the network is broken" calls actually come down to.
 #
-#    "This PC is slow"        -> disk health + space, memory pressure, uptime,
-#                                Defender state, pending reboot, startup load,
-#                                recent system errors - ending in a VERDICT,
-#                                and an offer to run cleanup when that is the
-#                                likely fix.
-#    "Is this new PC ready?"  -> on an office PC (WebApps configured) it also
-#                                tests that every office web system is
-#                                reachable. On a personal PC that section
-#                                simply does not exist - same tool for both.
+#  WHY IT IS ITS OWN TOOL
+#  ----------------------
+#  Every tool that reaches another PC - connecting a printer, reading a PC's
+#  shares, staging a driver, pulling an inventory - authenticates through the
+#  same stored credentials, and all of them fail the same way when an entry
+#  goes stale. It was reachable only from inside 'printer', which is the wrong
+#  door when the thing that is broken is a file share.
 #
-#  Read-only: nothing is changed unless you accept the cleanup offer at the
-#  end. Works without admin (a couple of checks read deeper with it).
+#  THE FAILURE WORTH KNOWING
+#  -------------------------
+#  A REFUSED query returns an EMPTY list, not an error. Windows then reports
+#  that the host shares nothing - which reads like a firewall or a Windows
+#  update problem, and is neither. After a domain password change every stored
+#  entry goes stale at once, so shares and printers appear to vanish across the
+#  office; that usually lands near a patch Tuesday and takes the blame for it.
+#  Uninstalling the update seems to fix it because of the reboot, so the wrong
+#  cure sticks and the real one is never found.
+#
+#  Two traps this flags in the list:
+#    - a user stored with NO domain prefix ('jsmith' rather than 'DOM\jsmith'),
+#      which a domain host rejects outright as "no such user" (0xc0000064),
+#    - a TERMSRV/ entry, which is Remote Desktop ONLY and does nothing for file
+#      or print access - easy to mistake for proof that the host is covered.
+#
+#  HOW TO RUN
+#  ----------
+#  From the pen or share menu (kd), pick "creds". Or directly:
+#     irm <host>/creds | iex
+#
+#  It is INTERACTIVE - it asks, it does not take parameters. (Parameters
+#  cannot be passed when a tool is run through iex, which is how the menu and
+#  the share launch every tool, so a menu tool has to prompt.)
+#
+#  SAFETY
+#  ------
+#  Listing changes nothing. Adding and deleting change Credential Manager for
+#  the CURRENT USER only, and deleting always confirms first. No elevation is
+#  needed, and that is deliberate - see the note below.
 # =============================================================================
 
 $ErrorActionPreference = 'SilentlyContinue'
 
 # <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
 $Site = @{
-    ShareBase = ''
-    PenMarker = 'network-tools'
-    WebApps   = @()
 }
 # <#/SITE#>
+# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
+function Write-Head($text) {
+    # The banner that opens a tool or a stage. 62 wide: the plurality of the
+    # tools already used it, it clears the longest heading in the toolkit, and
+    # it fits an 80-column console with room to spare.
+    Write-Host ''
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+}
+
+function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
+
+# --- asking, which is as much the house voice as printing ------------------
+#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
+#  two were written out in eight tools between them - identical but for the
+#  parameter name - which is a rule kept by hand, and a rule kept by hand is
+#  one that drifts the first time somebody is in a hurry.
+
+function Confirm-Action($prompt) {
+    # A plain yes/no. Anything not starting with y is no, so Enter is no.
+    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
+}
+
+function Confirm-Default($prompt, $default) {
+    # The same, but Enter takes the default and the prompt SAYS which - never
+    # "[default]" or a bare "(y/n)" that hides it.
+    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
+    $a = (Read-Host "  $prompt ($hint)").Trim()
+    if (-not $a) { return $default }
+    return ($a -match '^[Yy]')
+}
+# <#/VOICE#>
 
 # <#FUNCTIONS#>  generated from config/functions.ps1 by distribute.ps1 -Sync - do not edit by hand
 function Get-OrgRegKey {
@@ -1799,165 +1862,27 @@ function Find-KdComputerObject {
 }
 # <#/FUNCTIONS#>
 
-# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
-function Write-Head($text) {
-    # The banner that opens a tool or a stage. 62 wide: the plurality of the
-    # tools already used it, it clears the longest heading in the toolkit, and
-    # it fits an 80-column console with room to spare.
+Write-Host ''
+Write-Host ('=' * 62) -ForegroundColor Cyan
+Write-Host "  NETWORK CREDENTIALS  $env:COMPUTERNAME" -ForegroundColor Cyan
+Write-Host ('=' * 62) -ForegroundColor Cyan
+
+# Deliberately NOT elevated, and it must stay that way. cmdkey is PER-USER, so
+# running this as an admin account would show the technician's own vault while
+# the staff user's entries - the ones actually breaking their access - stayed
+# invisible. Run it as whoever is having the problem. Show-CredentialIdentity
+# says whose vault is on screen, and warns when it is not the console user's.
+$admin = ([Security.Principal.WindowsPrincipal] `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($admin) {
     Write-Host ''
-    Write-Host ('=' * 62) -ForegroundColor Cyan
-    Write-Host "  $text" -ForegroundColor Cyan
-    Write-Host ('=' * 62) -ForegroundColor Cyan
+    Write-Host '  !   Running elevated. cmdkey is per-user, so this is the ADMIN' -ForegroundColor Yellow
+    Write-Host '  !   account''s vault. To fix a staff member''s access, run this as' -ForegroundColor Yellow
+    Write-Host '  !   THEM, without elevation.' -ForegroundColor Yellow
 }
 
-function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
-function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
-function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
-function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
-function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
-function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
-
-# --- asking, which is as much the house voice as printing ------------------
-#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
-#  two were written out in eight tools between them - identical but for the
-#  parameter name - which is a rule kept by hand, and a rule kept by hand is
-#  one that drifts the first time somebody is in a hurry.
-
-function Confirm-Action($prompt) {
-    # A plain yes/no. Anything not starting with y is no, so Enter is no.
-    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
-}
-
-function Confirm-Default($prompt, $default) {
-    # The same, but Enter takes the default and the prompt SAYS which - never
-    # "[default]" or a bare "(y/n)" that hides it.
-    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
-    $a = (Read-Host "  $prompt ($hint)").Trim()
-    if (-not $a) { return $default }
-    return ($a -match '^[Yy]')
-}
-# <#/VOICE#>
-$issues = New-Object System.Collections.ArrayList   # what the verdict is built from
-function Add-Issue([string]$Severity, [string]$Text) { $null = $issues.Add([pscustomobject]@{ Sev = $Severity; Text = $Text }) }
+Invoke-CredentialMenu
 
 Write-Host ''
-Write-Host ('=' * 60) -ForegroundColor Cyan
-Write-Host "  PC-CHECK  -  $env:COMPUTERNAME  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
-Write-Host ('=' * 60) -ForegroundColor Cyan
-
-# --- Uptime ------------------------------------------------------------------
-Write-Head 'UPTIME'
-$os = Get-CimInstance Win32_OperatingSystem
-$up = (Get-Date) - $os.LastBootUpTime
-if ($up.TotalDays -ge 7) {
-    Write-Warn ("up {0:N1} days - Windows degrades without a real restart" -f $up.TotalDays)
-    Add-Issue 'warn' "not restarted for $([int]$up.TotalDays) days - restart it"
-} else { Write-Ok ("up {0:N1} days (booted {1:yyyy-MM-dd HH:mm})" -f $up.TotalDays, $os.LastBootUpTime) }
-Write-Dim "$($os.Caption) build $($os.BuildNumber)"
-
-# --- Disk health + space -----------------------------------------------------
-Write-Head 'DISKS'
-foreach ($pd in Get-PhysicalDisk) {
-    $flag = if ($pd.HealthStatus -eq 'Healthy') { 'OK' } else { 'BAD' }
-    if ($flag -eq 'OK') { Write-Ok ("{0}  {1}  {2:N0} GB  health: {3}" -f $pd.FriendlyName, $pd.MediaType, ($pd.Size/1GB), $pd.HealthStatus) }
-    else {
-        Write-Bad ("{0}  health: {1} - BACK IT UP NOW (see the backup tool)" -f $pd.FriendlyName, $pd.HealthStatus)
-        Add-Issue 'bad' "disk '$($pd.FriendlyName)' reports $($pd.HealthStatus) - back up and replace"
-    }
-}
-foreach ($sm in Get-CimInstance -Namespace root\wmi MSStorageDriver_FailurePredictStatus) {
-    if ($sm.PredictFailure) {
-        Write-Bad 'SMART predicts imminent disk FAILURE'
-        Add-Issue 'bad' 'SMART failure predicted - back up and replace the disk'
-    }
-}
-foreach ($v in Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' }) {
-    $pct = if ($v.Size) { [math]::Round(100 * $v.SizeRemaining / $v.Size) } else { 0 }
-    $line = "{0}:  {1:N0} GB free of {2:N0} GB ({3}%)" -f $v.DriveLetter, ($v.SizeRemaining/1GB), ($v.Size/1GB), $pct
-    if ($v.DriveLetter -eq ($env:SystemDrive.Trim(':')) -and ($pct -lt 10 -or $v.SizeRemaining -lt 15GB)) {
-        Write-Warn $line
-        Add-Issue 'warn' "C: is nearly full ($pct% free) - run cleanup"
-    } else { Write-Ok $line }
-}
-
-# --- Memory ------------------------------------------------------------------
-Write-Head 'MEMORY'
-$totGB  = $os.TotalVisibleMemorySize / 1MB
-$freeGB = $os.FreePhysicalMemory / 1MB
-$usedPct = [math]::Round(100 * (1 - $os.FreePhysicalMemory / $os.TotalVisibleMemorySize))
-$line = "{0:N1} GB of {1:N1} GB in use ({2}%)" -f ($totGB - $freeGB), $totGB, $usedPct
-if ($usedPct -ge 85) { Write-Warn $line; Add-Issue 'warn' "memory pressure ($usedPct% used) - cleanup can free it, or the PC needs more RAM" }
-else { Write-Ok $line }
-if ($totGB -lt 7) { Write-Warn ("only {0:N0} GB RAM - below comfortable for current Windows + Office" -f $totGB); Add-Issue 'warn' "only $([math]::Round($totGB)) GB RAM - upgrade candidate" }
-Write-Dim 'top consumers:'
-Get-Process | Group-Object Name | ForEach-Object {
-    [pscustomobject]@{ Name = $_.Name; MB = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum / 1MB) }
-} | Sort-Object MB -Descending | Select-Object -First 5 | ForEach-Object { Write-Dim ("  {0,-24} {1,6:N0} MB" -f $_.Name, $_.MB) }
-
-# --- Defender ----------------------------------------------------------------
-Write-Head 'DEFENDER'
-$mp = Get-MpComputerStatus
-if ($mp) {
-    if ($mp.RealTimeProtectionEnabled) { Write-Ok 'real-time protection on' } else { Write-Bad 'real-time protection OFF'; Add-Issue 'bad' 'Defender real-time protection is off' }
-    $age = ((Get-Date) - $mp.AntivirusSignatureLastUpdated).Days
-    if ($age -gt 7) { Write-Warn "signatures $age days old"; Add-Issue 'warn' "Defender signatures $age days old - no recent updates?" }
-    else { Write-Ok "signatures $age day(s) old" }
-} else { Write-Warn 'could not query Defender (needs admin on some PCs)' }
-
-# --- Pending reboot ----------------------------------------------------------
-Write-Head 'PENDING'
-$pend = @()
-if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'servicing (CBS)' }
-if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'Windows Update' }
-if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager').PendingFileRenameOperations) { $pend += 'file renames' }
-if ($pend) { Write-Warn ("restart pending: " + ($pend -join ', ')); Add-Issue 'warn' 'a restart is pending - restart before judging performance' }
-else { Write-Ok 'no restart pending' }
-
-# --- Recent system errors ----------------------------------------------------
-Write-Head 'EVENT LOG (last 24h)'
-$errs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = (Get-Date).AddDays(-1) } -MaxEvents 200)
-if ($errs.Count -eq 0) { Write-Ok 'no critical/error events' }
-else {
-    Write-Warn ("{0} error/critical event(s); most frequent:" -f $errs.Count)
-    $errs | Group-Object ProviderName | Sort-Object Count -Descending | Select-Object -First 3 |
-        ForEach-Object { Write-Dim ("  {0,3}x  {1}" -f $_.Count, $_.Name) }
-    if ($errs.Count -ge 20) { Add-Issue 'warn' "$($errs.Count) system errors in 24h - see Event Viewer (top: $((@($errs | Group-Object ProviderName | Sort-Object Count -Descending)[0]).Name))" }
-    if ($errs | Where-Object { $_.ProviderName -match 'disk|ntfs|storahci|iaStor' }) {
-        Add-Issue 'bad' 'DISK errors in the event log - back up and test the disk'
-    }
-}
-
-# --- Office web systems (office PCs only - blank list on personal PCs) -------
-if (@($Site.WebApps).Count -gt 0) {
-    Write-Head 'OFFICE WEB SYSTEMS'
-    $down = 0
-    foreach ($u in $Site.WebApps) {
-        $uri  = [Uri]$u
-        $port = if ($uri.Port -gt 0) { $uri.Port } elseif ($uri.Scheme -eq 'http') { 80 } else { 443 }
-        $tcp  = New-Object System.Net.Sockets.TcpClient
-        $sw   = [System.Diagnostics.Stopwatch]::StartNew()
-        $ok   = $false
-        try { $ok = $tcp.ConnectAsync($uri.Host, $port).Wait(2500) -and $tcp.Connected } catch { }
-        $tcp.Close()
-        if ($ok) { Write-Ok ("{0,-38} {1,4} ms" -f $uri.Host, $sw.ElapsedMilliseconds) }
-        else     { Write-Bad ("{0,-38} unreachable" -f $uri.Host); $down++ }
-    }
-    if ($down) { Add-Issue 'bad' "$down office web system(s) unreachable - check network/DNS (gateway-monitor digs deeper)" }
-}
-
-# --- Verdict -----------------------------------------------------------------
-Write-Head 'VERDICT'
-if ($issues.Count -eq 0) {
-    Write-Ok 'nothing wrong found. If it still feels slow, the next suspects are'
-    Write-Dim 'browser tab load and Office add-ins - things this check cannot weigh.'
-} else {
-    foreach ($i in ($issues | Sort-Object { if ($_.Sev -eq 'bad') { 0 } else { 1 } })) {
-        if ($i.Sev -eq 'bad') { Write-Bad $i.Text } else { Write-Warn $i.Text }
-    }
-}
-Write-KdToolLog 'pc-check' ("verdict: " + $(if ($issues.Count) { ($issues | ForEach-Object { $_.Text }) -join ' | ' } else { 'clean' }))
-
-# The most common fixes are one tool away - offer it when relevant.
-if ($issues | Where-Object { $_.Text -match 'cleanup|nearly full|memory pressure' }) {
-    if ((Read-Host '  Run the cleanup tool now? (y/n)') -match '^[Yy]') { Invoke-KdTool 'cleanup' }
-}
+Write-Host '  Done.' -ForegroundColor Green

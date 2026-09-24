@@ -4,7 +4,7 @@
 #
 #  AUTHOR
 #  ------
-#  KUDADONBE (KD)  -  Computer Consultancy
+#  KD  -  Computer Consultancy
 #  kudadonbe@outlook.com
 #
 #  WHAT IT DOES
@@ -47,26 +47,44 @@
 
 $ErrorActionPreference = 'Stop'
 
+# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
 function Write-Head($text) {
+    # The banner that opens a tool or a stage. 62 wide: the plurality of the
+    # tools already used it, it clears the longest heading in the toolkit, and
+    # it fits an 80-column console with room to spare.
     Write-Host ''
     Write-Host ('=' * 62) -ForegroundColor Cyan
     Write-Host "  $text" -ForegroundColor Cyan
     Write-Host ('=' * 62) -ForegroundColor Cyan
 }
+
 function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
 function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
 function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
 function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
 function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
 function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
-function Confirm-Action($prompt) { (Read-Host "  $prompt (y/n)") -match '^[Yy]' }
+
+# --- asking, which is as much the house voice as printing ------------------
+#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
+#  two were written out in eight tools between them - identical but for the
+#  parameter name - which is a rule kept by hand, and a rule kept by hand is
+#  one that drifts the first time somebody is in a hurry.
+
+function Confirm-Action($prompt) {
+    # A plain yes/no. Anything not starting with y is no, so Enter is no.
+    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
+}
+
 function Confirm-Default($prompt, $default) {
-    $hint = 'y/N'
-    if ($default) { $hint = 'Y/n' }
+    # The same, but Enter takes the default and the prompt SAYS which - never
+    # "[default]" or a bare "(y/n)" that hides it.
+    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
     $a = (Read-Host "  $prompt ($hint)").Trim()
     if (-not $a) { return $default }
     return ($a -match '^[Yy]')
 }
+# <#/VOICE#>
 function Format-Size($bytes) {
     if (-not $bytes) { return '0 B' }
     if ($bytes -ge 1TB) { return ('{0:N1} TB' -f ($bytes / 1TB)) }
@@ -77,17 +95,28 @@ function Format-Size($bytes) {
 }
 
 $Sha = [System.Security.Cryptography.SHA256]::Create()
-function Get-Sha256Fast([string]$Path) {
+function Get-Sha256Fast([string]$Path, [int]$MaxBytes) {
     $fs = $null
     try {
+        # ReadWrite share so a file another process is writing can still be read.
         $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
-        return [BitConverter]::ToString($Sha.ComputeHash($fs)).Replace('-', '')
-    } catch { return $null } finally { if ($fs) { $fs.Dispose() } }
+        if ($MaxBytes -gt 0) {
+            $buf = New-Object byte[] $MaxBytes
+            $n   = $fs.Read($buf, 0, $MaxBytes)
+            $h   = $Sha.ComputeHash($buf, 0, $n)
+        } else {
+            $h = $Sha.ComputeHash($fs)
+        }
+        return [BitConverter]::ToString($h).Replace('-', '')
+    }
+    catch   { return $null }   # unreadable: treat as UNIQUE, never as a duplicate
+    finally { if ($fs) { $fs.Dispose() } }
 }
 
 # Same four-signal test the backup tool uses: the cmdlet, the service, the AM
 # service flag and the engine's own answer all fail differently.
 function Test-DefenderAlive {
+    if ($env:KD_BACKUP_NODEFENDER -eq '1') { return $false }
     $st = $null
     try { $st = Get-MpComputerStatus -ErrorAction Stop } catch { return $false }
     if (-not $st) { return $false }
@@ -315,16 +344,16 @@ function Invoke-Restore([string]$Root) {
                Measure-Object Length -Sum).Sum
         Write-Host ("  {0,2}.  {1,-28}  {2}" -f ($i + 1), $profiles[$i].Name, (Format-Size $sz))
     }
-    $pick = (Read-Host '  Choice').Trim()
+    $pick = (Read-Host '  Choose').Trim()
     if ($pick -notmatch '^\d+$' -or [int]$pick -lt 1 -or [int]$pick -gt $profiles.Count) { Write-Warn 'Cancelled.'; return }
     $src = $profiles[[int]$pick - 1]
 
     Write-Sub 'WHAT TO PUT BACK'
-    Write-Host '  1.  Documents, Desktop and Pictures only   (the usual choice)'
-    Write-Host '  2.  Everything in the profile'
-    Write-Host '  3.  Just open the folder and let me drag it myself'
-    Write-Host '  0.  Back'
-    $what = (Read-Host '  Choice').Trim()
+    Write-Host '   1.  Documents, Desktop and Pictures only   (the usual choice)'
+    Write-Host '   2.  Everything in the profile'
+    Write-Host '   3.  Just open the folder and let me drag it myself'
+    Write-Host '   0.  Back'
+    $what = (Read-Host '  Choose').Trim()
     if ($what -eq '0' -or -not $what) { return }
     if ($what -eq '3') { Start-Process explorer.exe $src.FullName; return }
 
@@ -437,7 +466,7 @@ function Invoke-DeleteBackup([string]$Root) {
         $where = if ($isPen) { 'PEN' } else { $drive }
         $size  = (Get-ChildItem -LiteralPath $c.FullName -Recurse -File -Force -ErrorAction SilentlyContinue |
                   Measure-Object -Sum Length).Sum
-        Write-Host ("  {0}.  [{1,-3}]  {2}   {3}" -f ($i + 1), $where, $c.FullName, (Format-Size $size))
+        Write-Host ("  {0,2}.  [{1,-3}]  {2}   {3}" -f ($i + 1), $where, $c.FullName, (Format-Size $size))
         if (Confirm-Action "Delete this copy?") { $sel += $c }
     }
     if (-not $sel) { Write-Dim 'Nothing chosen - nothing deleted.'; return }
@@ -492,7 +521,7 @@ if ($backups.Count -gt 0) {
     Write-Host ''
     Write-Host '   P.  Type a path instead'
     Write-Host '   0.  Exit'
-    $pick = (Read-Host '  Choice').Trim()
+    $pick = (Read-Host '  Choose').Trim()
     if ($pick -eq '0') { return }
     if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $backups.Count) {
         $root = $backups[[int]$pick - 1].FullName
@@ -522,13 +551,13 @@ $script:restoredThisSession = $false
 
 while ($true) {
     Write-Sub 'WHAT NOW'
-    Write-Host '  1.  Verify it against the manifest   (nothing is changed)'
-    Write-Host '  2.  Virus-scan it with Defender      (needed before restoring)'
-    Write-Host '  3.  Restore a profile'
-    Write-Host '  4.  Open the backup folder'
-    Write-Host '  5.  Delete this backup    (after restoring - frees the pen / D:)'
-    Write-Host '  0.  Exit'
-    $c = (Read-Host '  Choice').Trim()
+    Write-Host '   1.  Verify it against the manifest   (nothing is changed)'
+    Write-Host '   2.  Virus-scan it with Defender      (needed before restoring)'
+    Write-Host '   3.  Restore a profile'
+    Write-Host '   4.  Open the backup folder'
+    Write-Host '   5.  Delete this backup    (after restoring - frees the pen / D:)'
+    Write-Host '   0.  Exit'
+    $c = (Read-Host '  Choose').Trim()
 
     if ($c -eq '0' -or -not $c) { break }
     elseif ($c -eq '1') { Write-Sub 'VERIFY'; $verified = Invoke-Verify $root }

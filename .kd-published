@@ -1,9 +1,10 @@
 asset
+avas
 backup
 backup-restore
 cleanup
+creds
 gateway-monitor
-kd
 pc-check
 printer-clear
 printer-diag

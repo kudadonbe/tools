@@ -4,7 +4,7 @@
 #
 #  AUTHOR
 #  ------
-#  KUDADONBE (KD)  -  Computer Consultancy
+#  KD  -  Computer Consultancy
 #  kudadonbe@outlook.com
 #
 #  WHAT IT DOES
@@ -40,16 +40,44 @@ $Site = @{
 }
 # <#/SITE#>
 
+# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
 function Write-Head($text) {
+    # The banner that opens a tool or a stage. 62 wide: the plurality of the
+    # tools already used it, it clears the longest heading in the toolkit, and
+    # it fits an 80-column console with room to spare.
     Write-Host ''
-    Write-Host ('=' * 60) -ForegroundColor Cyan
+    Write-Host ('=' * 62) -ForegroundColor Cyan
     Write-Host "  $text" -ForegroundColor Cyan
-    Write-Host ('=' * 60) -ForegroundColor Cyan
+    Write-Host ('=' * 62) -ForegroundColor Cyan
 }
+
 function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
 function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
 
+# --- asking, which is as much the house voice as printing ------------------
+#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
+#  two were written out in eight tools between them - identical but for the
+#  parameter name - which is a rule kept by hand, and a rule kept by hand is
+#  one that drifts the first time somebody is in a hurry.
 
+function Confirm-Action($prompt) {
+    # A plain yes/no. Anything not starting with y is no, so Enter is no.
+    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
+}
+
+function Confirm-Default($prompt, $default) {
+    # The same, but Enter takes the default and the prompt SAYS which - never
+    # "[default]" or a bare "(y/n)" that hides it.
+    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
+    $a = (Read-Host "  $prompt ($hint)").Trim()
+    if (-not $a) { return $default }
+    return ($a -match '^[Yy]')
+}
+# <#/VOICE#>
 # Turn the ACL's SID-strings into names a human reads, and its rights bits into
 # plain words. Only the printer-level ACEs matter here (the OIIO/inherit-only
 # ones apply to documents, not the right to print).

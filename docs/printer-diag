@@ -4,7 +4,7 @@
 #
 #  AUTHOR
 #  ------
-#  KUDADONBE (KD)  -  Computer Consultancy
+#  KD  -  Computer Consultancy
 #  kudadonbe@outlook.com
 #
 #  WHAT IT DOES
@@ -37,8 +37,49 @@ $Site = @{
 }
 # <#/SITE#>
 
-function Head($t) { Write-Host ''; Write-Host "-- $t --" -ForegroundColor Cyan }
-function Flag($t) { Write-Host "  !! $t" -ForegroundColor Yellow }
+# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
+function Write-Head($text) {
+    # The banner that opens a tool or a stage. 62 wide: the plurality of the
+    # tools already used it, it clears the longest heading in the toolkit, and
+    # it fits an 80-column console with room to spare.
+    Write-Host ''
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+}
+
+function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
+
+# --- asking, which is as much the house voice as printing ------------------
+#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
+#  two were written out in eight tools between them - identical but for the
+#  parameter name - which is a rule kept by hand, and a rule kept by hand is
+#  one that drifts the first time somebody is in a hurry.
+
+function Confirm-Action($prompt) {
+    # A plain yes/no. Anything not starting with y is no, so Enter is no.
+    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
+}
+
+function Confirm-Default($prompt, $default) {
+    # The same, but Enter takes the default and the prompt SAYS which - never
+    # "[default]" or a bare "(y/n)" that hides it.
+    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
+    $a = (Read-Host "  $prompt ($hint)").Trim()
+    if (-not $a) { return $default }
+    return ($a -match '^[Yy]')
+}
+# <#/VOICE#>
+
+# Head here is a SECTION header, not a tool banner - six of them in one short
+# report - so it maps to Write-Sub, which is that shape. Flag is a warning.
+function Head($t) { Write-Sub  $t }
+function Flag($t) { Write-Warn $t }
 
 # ---------------------------------------------------------------------------
 #  REPORT LOG
@@ -62,8 +103,16 @@ $cs  = Get-CimInstance Win32_ComputerSystem
 $adm = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
+# ProductName still reads "Windows 10 Pro" on Windows 11 - Microsoft never
+# updated the key, so a 25H2 PC reports itself as 10. That matters HERE: the
+# hardening notes below say "Win11 22H2+", and a technician reading "Windows 10"
+# on a build-26200 PC will rule out the very defaults that are biting them.
+# Build 22000 is the 10/11 line, so derive the name and ignore ProductName.
+$osName = if ([int]$os.CurrentBuildNumber -ge 22000) { $os.ProductName -replace 'Windows 10', 'Windows 11' }
+          else                                       { $os.ProductName }
+
 Write-Host ('=' * 62) -ForegroundColor Cyan
-Write-Host ("  PRINT DIAG  {0}   {1} {2} (build {3}.{4})" -f $env:COMPUTERNAME, $os.ProductName, $os.DisplayVersion, $os.CurrentBuildNumber, $os.UBR)
+Write-Host ("  PRINT DIAG  {0}   {1} {2} (build {3}.{4})" -f $env:COMPUTERNAME, $osName, $os.DisplayVersion, $os.CurrentBuildNumber, $os.UBR)
 Write-Host ("  domain-joined: {0}   elevated: {1}" -f $cs.PartOfDomain, $adm)
 if (-not $adm) { Write-Host '  (not elevated - Security-log logon failures will be skipped)' -ForegroundColor DarkGray }
 Write-Host ('=' * 62) -ForegroundColor Cyan
@@ -132,7 +181,12 @@ if ($adm) {
         foreach ($f in $fail) {
             $x = [xml]$f.ToXml(); $d = @{}; $x.Event.EventData.Data | ForEach-Object { $d[$_.Name] = $_.'#text' }
             $sub = ($d.SubStatus).ToLower()
-            $logonFails += [pscustomobject]@{ User = "$($d.TargetDomainName)\$($d.TargetUserName)"; From = $d.IpAddress; Sub = $sub }
+            # '::1' / '127.0.0.1' / '-' mean the attempt came from THIS PC, not
+            # over the wire - i.e. a credential cached HERE (cmdkey) was replayed
+            # and refused. That flips the fix from "go fix the other PC" to "the
+            # entry in this PC's Credential Manager is stale", so keep the flag.
+            $local = $d.IpAddress -in @('::1', '127.0.0.1', '-', '')
+            $logonFails += [pscustomobject]@{ User = "$($d.TargetDomainName)\$($d.TargetUserName)"; From = $d.IpAddress; Sub = $sub; Local = $local }
             Write-Host ("  {0:MM-dd HH:mm}  {1}\{2}  from {3}  {4}  {5}" -f $f.TimeCreated, $d.TargetDomainName, $d.TargetUserName, $d.IpAddress, $sub, $why[$sub])
         }
     } else { Write-Host '  none' }
@@ -157,7 +211,36 @@ if ($logonFails) {
                   "to the domain. This is NOT a Windows-update problem."
     }
     $badPw = $logonFails | Where-Object { $_.Sub -eq '0xc000006a' }
-    if ($badPw) { $known += 'AUTH FAILURE (0xc000006a) - a stored credential has the wrong password. Update the cmdkey entry.' }
+    if ($badPw) {
+        # The account EXISTS and the password is wrong - a different fix from
+        # 0xc0000064 above, and the one most often misread as an update fault.
+        $who = ($badPw.User | Sort-Object -Unique) -join ', '
+        if ($badPw | Where-Object Local) {
+            $known += "AUTH FAILURE (0xc000006a) for $who from THIS PC (::1) - the password " +
+                      "cached HERE in Credential Manager is stale, most likely because the " +
+                      "domain password was rotated. Nothing is wrong with the other PC. " +
+                      "Fix: cmdkey /delete the entries for the host (BOTH its name and its IP), " +
+                      "then re-run printer and enter the current password once."
+        } else {
+            $src = ($badPw.From | Sort-Object -Unique) -join ', '
+            $known += "AUTH FAILURE (0xc000006a) for $who from $src - that PC has a stored " +
+                      "credential with the wrong password. Fix it THERE: cmdkey /delete, then re-add."
+        }
+        # This is the symptom that sends people hunting the wrong fault: a
+        # refused query returns an EMPTY LIST, not an error, so Windows says the
+        # host shares nothing. Say so, or the next hour goes on firewalls.
+        $known += "NOTE: a refused query returns an EMPTY list, not an error - so this same bad " +
+                  "password is what makes 'No shared printers found' / 'no printer is shared by " +
+                  "<host>' appear. Fix the credential BEFORE suspecting firewall, RPC or Point-and-Print."
+        # Repeated bad-password attempts lock the account out - and on this
+        # domain the printing credential is often an admin one.
+        if (@($badPw).Count -ge 3) {
+            # NOTE the extra parens: -f binds tighter than +, so the format must
+            # be applied to the JOINED string, not just the last fragment.
+            $known += (("LOCKOUT RISK: {0} bad-password attempts already logged. Do NOT retry the " +
+                        "connect to test it - each try counts. Check with:  net user <user> /domain") -f @($badPw).Count)
+        }
+    }
 }
 if ($msgs -match '0x0000011b')            { $known += '0x0000011b LOGGED -> RPC packet-privacy mismatch (KB5005565 class). Fix: patch BOTH sides to current builds; RpcAuthnLevelPrivacyEnabled=0 on the host is a DIAGNOSIS-ONLY test that re-opens the CVE.' }
 if ($msgs -match '0x00000709')            { $known += '0x00000709 LOGGED -> name / default-printer conflict, or GP adding a queue that has moved (check the target with printer-info).' }

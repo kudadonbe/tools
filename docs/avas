@@ -1,5 +1,5 @@
 # =============================================================================
-#  pc-check.ps1  -  60-second triage: why is this PC slow / is this PC ready?
+#  avas.ps1  -  avas, the KD Network Tools launcher (published as avas.txt / tools/avas)
 # =============================================================================
 #
 #  AUTHOR
@@ -9,31 +9,70 @@
 #
 #  WHAT IT DOES
 #  ------------
-#  The two questions this answers, read-only, in about a minute:
+#  Shows a numbered menu of the tools and runs whichever one you pick, so you
+#  remember ONE line instead of each tool's own. Two modes, from one file:
+#    - on a managed LAN (ShareBase set): reads each tool as .txt off the share.
+#    - public (no ShareBase): fetches each tool from the public hub over https.
+#  The public menu lists only the tools flagged Public.
 #
-#    "This PC is slow"        -> disk health + space, memory pressure, uptime,
-#                                Defender state, pending reboot, startup load,
-#                                recent system errors - ending in a VERDICT,
-#                                and an offer to run cleanup when that is the
-#                                likely fix.
-#    "Is this new PC ready?"  -> on an office PC (WebApps configured) it also
-#                                tests that every office web system is
-#                                reachable. On a personal PC that section
-#                                simply does not exist - same tool for both.
+#     irm <host>/<launcher> | iex
 #
-#  Read-only: nothing is changed unless you accept the cleanup offer at the
-#  end. Works without admin (a couple of checks read deeper with it).
+#  After a tool finishes it returns to the menu, so you can run several tools
+#  in one session. Pick 0 (or just press Enter) to quit.
+#
+#  ADDING A TOOL
+#  -------------
+#  Add one line to the $tools list below (Name, Public, Desc). Internal fetch
+#  is <ShareBase>\<Name>.txt; public fetch is <PublicBase>/<Name>.
 # =============================================================================
 
 $ErrorActionPreference = 'SilentlyContinue'
 
 # <#SITE#>  generated from config/site.psd1 by distribute.ps1 -Sync - do not edit by hand
 $Site = @{
-    ShareBase = ''
-    PenMarker = 'network-tools'
-    WebApps   = @()
+    ShareBase  = ''
+    PublicBase = 'https://kudadonbe.github.io/tools'
+    PenMarker  = 'network-tools'
 }
 # <#/SITE#>
+# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
+function Write-Head($text) {
+    # The banner that opens a tool or a stage. 62 wide: the plurality of the
+    # tools already used it, it clears the longest heading in the toolkit, and
+    # it fits an 80-column console with room to spare.
+    Write-Host ''
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+    Write-Host "  $text" -ForegroundColor Cyan
+    Write-Host ('=' * 62) -ForegroundColor Cyan
+}
+
+function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
+function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
+function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
+function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
+function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
+function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
+
+# --- asking, which is as much the house voice as printing ------------------
+#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
+#  two were written out in eight tools between them - identical but for the
+#  parameter name - which is a rule kept by hand, and a rule kept by hand is
+#  one that drifts the first time somebody is in a hurry.
+
+function Confirm-Action($prompt) {
+    # A plain yes/no. Anything not starting with y is no, so Enter is no.
+    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
+}
+
+function Confirm-Default($prompt, $default) {
+    # The same, but Enter takes the default and the prompt SAYS which - never
+    # "[default]" or a bare "(y/n)" that hides it.
+    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
+    $a = (Read-Host "  $prompt ($hint)").Trim()
+    if (-not $a) { return $default }
+    return ($a -match '^[Yy]')
+}
+# <#/VOICE#>
 
 # <#FUNCTIONS#>  generated from config/functions.ps1 by distribute.ps1 -Sync - do not edit by hand
 function Get-OrgRegKey {
@@ -1799,165 +1838,167 @@ function Find-KdComputerObject {
 }
 # <#/FUNCTIONS#>
 
-# <#VOICE#>  generated from config/voice.ps1 by distribute.ps1 -Sync - do not edit by hand
-function Write-Head($text) {
-    # The banner that opens a tool or a stage. 62 wide: the plurality of the
-    # tools already used it, it clears the longest heading in the toolkit, and
-    # it fits an 80-column console with room to spare.
+# ShareBase present -> internal (read .txt off the share). Empty -> public
+# (fetch each tool from the hub over https).
+$public = -not $Site.ShareBase
+
+# --- Tool catalogue --------------------------------------------------------
+#  Name = tool + menu label, Desc = one-line description, Show = where it is
+#  listed: 'both', 'internal', or 'public'. The individual printer-* tools are
+#  'public' - internally the 'printer' hub covers them, so they are not repeated
+#  in the office menu. Fetch target is derived from the mode.
+$tools = @(
+    [pscustomobject]@{ Name = 'creds'; Pin = 'C';           Show = 'both';     Desc = 'Sign in / saved network credentials - everything below uses these' }
+    [pscustomobject]@{ Name = 'pc-check'; Break = 'at the desk';        Show = 'both';     Desc = '60-second triage: slow PC / new-PC readiness (read-only)' }
+    [pscustomobject]@{ Name = 'cleanup';         Show = 'both';     Desc = 'Flush temp, reclaim C:, free memory/browsers (admin)' }
+    [pscustomobject]@{ Name = 'sysinfo'; Break = 'record what it is';         Show = 'both';     Desc = 'PC inventory snapshot' }
+    [pscustomobject]@{ Name = 'asset';           Show = 'both';     Desc = 'Record asset numbers for this desk (PC, monitor, ...) (admin)' }
+    [pscustomobject]@{ Name = 'local-user';      Show = 'both';     Desc = 'Local accounts on this PC - create, reset, admin/standard (admin)' }
+    [pscustomobject]@{ Name = 'backup';          Show = 'both';     Desc = 'Rescue user data before a format - deduped, virus-safe, 2nd copy on a pen (admin)' }
+    [pscustomobject]@{ Name = 'backup-restore';  Show = 'both';     Desc = 'Check a backup and put it back on the rebuilt PC (admin)' }
+    [pscustomobject]@{ Name = 'gateway-monitor'; Show = 'both';     Desc = 'Connectivity diagnostic' }
+    [pscustomobject]@{ Name = 'printer-info';    Show = 'public';   Desc = "Show a PC's printers, remotely" }
+    [pscustomobject]@{ Name = 'printer-diag';    Show = 'public';   Desc = 'Diagnose print sharing failures' }
+    [pscustomobject]@{ Name = 'printer-clear';   Show = 'public';   Desc = 'Clear stuck print jobs' }
+)
+# The menu for this context: 'both' plus the current tier's own entries.
+$tier = if ($public) { 'public' } else { 'internal' }
+# The numbered list excludes anything PINNED: a pin is a prerequisite, not a
+# task, and numbering it invites picking it as if it were one.
+$menu   = @($tools | Where-Object { ($_.Show -eq 'both' -or $_.Show -eq $tier) -and -not $_.Pin })
+$pinned = @($tools | Where-Object { ($_.Show -eq 'both' -or $_.Show -eq $tier) -and $_.Pin })
+
+
+function Show-Menu {
     Write-Host ''
-    Write-Host ('=' * 62) -ForegroundColor Cyan
-    Write-Host "  $text" -ForegroundColor Cyan
-    Write-Host ('=' * 62) -ForegroundColor Cyan
-}
-
-function Write-Sub($text)  { Write-Host ''; Write-Host "-- $text --" -ForegroundColor White }
-function Write-Step($text) { Write-Host "  ->  $text" -ForegroundColor Gray }
-function Write-Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
-function Write-Warn($text) { Write-Host "  !   $text" -ForegroundColor Yellow }
-function Write-Bad($text)  { Write-Host "  X   $text" -ForegroundColor Red }
-function Write-Dim($text)  { Write-Host "      $text" -ForegroundColor DarkGray }
-
-# --- asking, which is as much the house voice as printing ------------------
-#  Rule 5 in CLAUDE.md: every prompt in the toolkit reads the same way. These
-#  two were written out in eight tools between them - identical but for the
-#  parameter name - which is a rule kept by hand, and a rule kept by hand is
-#  one that drifts the first time somebody is in a hurry.
-
-function Confirm-Action($prompt) {
-    # A plain yes/no. Anything not starting with y is no, so Enter is no.
-    return ((Read-Host "  $prompt (y/n)") -match '^[Yy]')
-}
-
-function Confirm-Default($prompt, $default) {
-    # The same, but Enter takes the default and the prompt SAYS which - never
-    # "[default]" or a bare "(y/n)" that hides it.
-    $hint = if ($default) { 'y/n, Enter = y' } else { 'y/n, Enter = n' }
-    $a = (Read-Host "  $prompt ($hint)").Trim()
-    if (-not $a) { return $default }
-    return ($a -match '^[Yy]')
-}
-# <#/VOICE#>
-$issues = New-Object System.Collections.ArrayList   # what the verdict is built from
-function Add-Issue([string]$Severity, [string]$Text) { $null = $issues.Add([pscustomobject]@{ Sev = $Severity; Text = $Text }) }
-
-Write-Host ''
-Write-Host ('=' * 60) -ForegroundColor Cyan
-Write-Host "  PC-CHECK  -  $env:COMPUTERNAME  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor Cyan
-Write-Host ('=' * 60) -ForegroundColor Cyan
-
-# --- Uptime ------------------------------------------------------------------
-Write-Head 'UPTIME'
-$os = Get-CimInstance Win32_OperatingSystem
-$up = (Get-Date) - $os.LastBootUpTime
-if ($up.TotalDays -ge 7) {
-    Write-Warn ("up {0:N1} days - Windows degrades without a real restart" -f $up.TotalDays)
-    Add-Issue 'warn' "not restarted for $([int]$up.TotalDays) days - restart it"
-} else { Write-Ok ("up {0:N1} days (booted {1:yyyy-MM-dd HH:mm})" -f $up.TotalDays, $os.LastBootUpTime) }
-Write-Dim "$($os.Caption) build $($os.BuildNumber)"
-
-# --- Disk health + space -----------------------------------------------------
-Write-Head 'DISKS'
-foreach ($pd in Get-PhysicalDisk) {
-    $flag = if ($pd.HealthStatus -eq 'Healthy') { 'OK' } else { 'BAD' }
-    if ($flag -eq 'OK') { Write-Ok ("{0}  {1}  {2:N0} GB  health: {3}" -f $pd.FriendlyName, $pd.MediaType, ($pd.Size/1GB), $pd.HealthStatus) }
-    else {
-        Write-Bad ("{0}  health: {1} - BACK IT UP NOW (see the backup tool)" -f $pd.FriendlyName, $pd.HealthStatus)
-        Add-Issue 'bad' "disk '$($pd.FriendlyName)' reports $($pd.HealthStatus) - back up and replace"
+    Write-Host ('=' * 44) -ForegroundColor Cyan
+    Write-Host '  avas  -  KD Tools' -ForegroundColor Cyan
+    Write-Host ('=' * 44) -ForegroundColor Cyan
+    foreach ($t in $pinned) {
+        $lab = if ($t.Label) { $t.Label } else { $t.Name }
+        Write-Host ("   {0}.  {1,-18}{2}" -f $t.Pin, $lab, $t.Desc) -ForegroundColor Cyan
     }
-}
-foreach ($sm in Get-CimInstance -Namespace root\wmi MSStorageDriver_FailurePredictStatus) {
-    if ($sm.PredictFailure) {
-        Write-Bad 'SMART predicts imminent disk FAILURE'
-        Add-Issue 'bad' 'SMART failure predicted - back up and replace the disk'
+    for ($i = 0; $i -lt $menu.Count; $i++) {
+        # A divider names the group the next entries belong to. It is a
+        # PROPERTY of an entry, not a row of its own, so the numbering stays
+        # unbroken and a hidden tool cannot leave a heading with nothing under it.
+        if ($menu[$i].Break) { Write-Host ''; Write-Host ("  -- {0} --" -f $menu[$i].Break) -ForegroundColor DarkGray }
+        $lab = if ($menu[$i].Label) { $menu[$i].Label } else { $menu[$i].Name }
+        Write-Host ("  {0,2}.  {1,-18}{2}" -f ($i + 1), $lab, $menu[$i].Desc)
     }
-}
-foreach ($v in Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' }) {
-    $pct = if ($v.Size) { [math]::Round(100 * $v.SizeRemaining / $v.Size) } else { 0 }
-    $line = "{0}:  {1:N0} GB free of {2:N0} GB ({3}%)" -f $v.DriveLetter, ($v.SizeRemaining/1GB), ($v.Size/1GB), $pct
-    if ($v.DriveLetter -eq ($env:SystemDrive.Trim(':')) -and ($pct -lt 10 -or $v.SizeRemaining -lt 15GB)) {
-        Write-Warn $line
-        Add-Issue 'warn' "C: is nearly full ($pct% free) - run cleanup"
-    } else { Write-Ok $line }
+    Write-Host ''
+    # On the public hub, offer to load the full office menu from a share the
+    # technician names at runtime. Nothing about the office is baked in here.
+    if ($public) { Write-Host '   O.  Office tools        (load the full menu from an office share)' -ForegroundColor DarkCyan }
+    Write-Host '   0.  exit'
+    Write-Host ('=' * 44) -ForegroundColor Cyan
 }
 
-# --- Memory ------------------------------------------------------------------
-Write-Head 'MEMORY'
-$totGB  = $os.TotalVisibleMemorySize / 1MB
-$freeGB = $os.FreePhysicalMemory / 1MB
-$usedPct = [math]::Round(100 * (1 - $os.FreePhysicalMemory / $os.TotalVisibleMemorySize))
-$line = "{0:N1} GB of {1:N1} GB in use ({2}%)" -f ($totGB - $freeGB), $totGB, $usedPct
-if ($usedPct -ge 85) { Write-Warn $line; Add-Issue 'warn' "memory pressure ($usedPct% used) - cleanup can free it, or the PC needs more RAM" }
-else { Write-Ok $line }
-if ($totGB -lt 7) { Write-Warn ("only {0:N0} GB RAM - below comfortable for current Windows + Office" -f $totGB); Add-Issue 'warn' "only $([math]::Round($totGB)) GB RAM - upgrade candidate" }
-Write-Dim 'top consumers:'
-Get-Process | Group-Object Name | ForEach-Object {
-    [pscustomobject]@{ Name = $_.Name; MB = [math]::Round(($_.Group | Measure-Object WorkingSet64 -Sum).Sum / 1MB) }
-} | Sort-Object MB -Descending | Select-Object -First 5 | ForEach-Object { Write-Dim ("  {0,-24} {1,6:N0} MB" -f $_.Name, $_.MB) }
 
-# --- Defender ----------------------------------------------------------------
-Write-Head 'DEFENDER'
-$mp = Get-MpComputerStatus
-if ($mp) {
-    if ($mp.RealTimeProtectionEnabled) { Write-Ok 'real-time protection on' } else { Write-Bad 'real-time protection OFF'; Add-Issue 'bad' 'Defender real-time protection is off' }
-    $age = ((Get-Date) - $mp.AntivirusSignatureLastUpdated).Days
-    if ($age -gt 7) { Write-Warn "signatures $age days old"; Add-Issue 'warn' "Defender signatures $age days old - no recent updates?" }
-    else { Write-Ok "signatures $age day(s) old" }
-} else { Write-Warn 'could not query Defender (needs admin on some PCs)' }
+# Load the INTERNAL launcher (avas.txt) from an office share the tech types in,
+# then hand control to it - it carries the office config and the full toolset.
+# The path is entered every time, so this public file leaks nothing.
+function Invoke-OfficeMenu {
+    Write-Host ''
+    $sp = (Read-Host '  Office share path (e.g. \\server\share\kd\04_Network)').Trim()
+    if (-not $sp) { return }
+    $runTxt = Join-Path $sp 'avas.txt'
 
-# --- Pending reboot ----------------------------------------------------------
-Write-Head 'PENDING'
-$pend = @()
-if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'servicing (CBS)' }
-if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'Windows Update' }
-if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager').PendingFileRenameOperations) { $pend += 'file renames' }
-if ($pend) { Write-Warn ("restart pending: " + ($pend -join ', ')); Add-Issue 'warn' 'a restart is pending - restart before judging performance' }
-else { Write-Ok 'no restart pending' }
-
-# --- Recent system errors ----------------------------------------------------
-Write-Head 'EVENT LOG (last 24h)'
-$errs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = (Get-Date).AddDays(-1) } -MaxEvents 200)
-if ($errs.Count -eq 0) { Write-Ok 'no critical/error events' }
-else {
-    Write-Warn ("{0} error/critical event(s); most frequent:" -f $errs.Count)
-    $errs | Group-Object ProviderName | Sort-Object Count -Descending | Select-Object -First 3 |
-        ForEach-Object { Write-Dim ("  {0,3}x  {1}" -f $_.Count, $_.Name) }
-    if ($errs.Count -ge 20) { Add-Issue 'warn' "$($errs.Count) system errors in 24h - see Event Viewer (top: $((@($errs | Group-Object ProviderName | Sort-Object Count -Descending)[0]).Name))" }
-    if ($errs | Where-Object { $_.ProviderName -match 'disk|ntfs|storahci|iaStor' }) {
-        Add-Issue 'bad' 'DISK errors in the event log - back up and test the disk'
+    $code = $null
+    try { $code = Get-Content -Path $runTxt -Raw -ErrorAction Stop }
+    catch {
+        Write-Host "  Could not read $runTxt" -ForegroundColor Yellow
+        $ans = Read-Host '  Sign in with a domain account and retry? (y/n)'
+        if ($ans -match '^[Yy]') {
+            $cred = Get-KdCredential -Purpose 'the file server' -Message 'Domain account with access to the office share'
+            if ($cred) {
+                try {
+                    New-PSDrive -Name KDOffice -PSProvider FileSystem -Root $sp -Credential $cred -ErrorAction Stop | Out-Null
+                    $code = Get-Content -Path $runTxt -Raw -ErrorAction Stop
+                }
+                catch { Write-Host "  Still no access: $($_.Exception.Message)" -ForegroundColor Red; Forget-KdCredentialIfRefused -Purpose 'the file server' -Because $_ }
+                finally { Remove-PSDrive -Name KDOffice -Force -ErrorAction SilentlyContinue }
+            }
+        }
     }
-}
-
-# --- Office web systems (office PCs only - blank list on personal PCs) -------
-if (@($Site.WebApps).Count -gt 0) {
-    Write-Head 'OFFICE WEB SYSTEMS'
-    $down = 0
-    foreach ($u in $Site.WebApps) {
-        $uri  = [Uri]$u
-        $port = if ($uri.Port -gt 0) { $uri.Port } elseif ($uri.Scheme -eq 'http') { 80 } else { 443 }
-        $tcp  = New-Object System.Net.Sockets.TcpClient
-        $sw   = [System.Diagnostics.Stopwatch]::StartNew()
-        $ok   = $false
-        try { $ok = $tcp.ConnectAsync($uri.Host, $port).Wait(2500) -and $tcp.Connected } catch { }
-        $tcp.Close()
-        if ($ok) { Write-Ok ("{0,-38} {1,4} ms" -f $uri.Host, $sw.ElapsedMilliseconds) }
-        else     { Write-Bad ("{0,-38} unreachable" -f $uri.Host); $down++ }
+    if ([string]::IsNullOrWhiteSpace($code)) {
+        Write-Host '  Tip: a brand-new PC has no network yet - use the setup pen for those.' -ForegroundColor DarkGray
+        return
     }
-    if ($down) { Add-Issue 'bad' "$down office web system(s) unreachable - check network/DNS (gateway-monitor digs deeper)" }
+    & ([scriptblock]::Create($code))
 }
 
-# --- Verdict -----------------------------------------------------------------
-Write-Head 'VERDICT'
-if ($issues.Count -eq 0) {
-    Write-Ok 'nothing wrong found. If it still feels slow, the next suspects are'
-    Write-Dim 'browser tab load and Office add-ins - things this check cannot weigh.'
-} else {
-    foreach ($i in ($issues | Sort-Object { if ($_.Sev -eq 'bad') { 0 } else { 1 } })) {
-        if ($i.Sev -eq 'bad') { Write-Bad $i.Text } else { Write-Warn $i.Text }
+
+# --- Main loop -------------------------------------------------------------
+while ($true) {
+    Show-Menu
+    $choice = Read-Host '  Choose'
+
+    # 0 or empty = quit
+    if ($choice -eq '0' -or [string]::IsNullOrWhiteSpace($choice)) {
+        Write-Host '  Done.' -ForegroundColor Green
+        Forget-KdCredential
+        break
     }
-}
-Write-KdToolLog 'pc-check' ("verdict: " + $(if ($issues.Count) { ($issues | ForEach-Object { $_.Text }) -join ' | ' } else { 'clean' }))
 
-# The most common fixes are one tool away - offer it when relevant.
-if ($issues | Where-Object { $_.Text -match 'cleanup|nearly full|memory pressure' }) {
-    if ((Read-Host '  Run the cleanup tool now? (y/n)') -match '^[Yy]') { Invoke-KdTool 'cleanup' }
+    # Public hub only: 'O' loads the full office menu from a named share.
+    if ($public -and $choice -match '^[Oo]$') { Invoke-OfficeMenu; continue }
+
+    # A pinned letter runs its tool exactly as a number would.
+    $pin = @($pinned | Where-Object { $choice -match "^[$($_.Pin)]$" })[0]
+    if ($pin) { $tool = $pin }
+
+    if (-not $pin) {
+        # Validate the choice is a number within range
+        $index = 0
+        if (-not [int]::TryParse($choice, [ref]$index) -or $index -lt 1 -or $index -gt $menu.Count) {
+            Write-Host "  Invalid choice: '$choice'" -ForegroundColor Yellow
+            continue
+        }
+        $tool = $menu[$index - 1]
+    }
+
+    Write-Host ''
+    Write-Host "  Launching $($tool.Name)..." -ForegroundColor Cyan
+    Write-Host ''
+
+    # Fetch the tool's text and run it. [scriptblock]::Create + & runs it with
+    # its own param() defaults intact. Internal: Get-Content off the share (the
+    # reliable way to read a UNC path on Windows PowerShell 5.1). Public: irm
+    # over https (which works on both 5.1 and 7 for a real URL).
+    # Every launch is logged (start, finish + duration, or the error) - the
+    # menu is the one door every tool goes through, so logging here covers the
+    # whole kit without touching each tool.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-KdToolLog 'avas' "launch $($tool.Name)"
+    $ts = Start-KdTranscript $tool.Name
+    $global:KdRunFailure = $null          # a tool that fails politely sets this (Set-KdRunFailed)
+    $failedWhy = $null
+    try {
+        if ($public) {
+            $code = Invoke-RestMethod -Uri "$($Site.PublicBase)/$($tool.Name)" -ErrorAction Stop
+        } else {
+            # Most tools sit directly on the share; a tool with Sub lives in
+            # that subfolder (the server family ships to <share>\server).
+            $rel  = if ($tool.Sub) { Join-Path $tool.Sub "$($tool.Name).txt" } else { "$($tool.Name).txt" }
+            $code = Get-Content -Path (Join-Path $Site.ShareBase $rel) -Raw -ErrorAction Stop
+        }
+        if ([string]::IsNullOrWhiteSpace($code)) { throw 'tool is empty' }
+        & ([scriptblock]::Create($code))
+        if ($global:KdRunFailure) {
+            $failedWhy = "$global:KdRunFailure"
+            Write-KdToolLog 'avas' ("FAILED {0} after {1:N0}s: {2}" -f $tool.Name, $sw.Elapsed.TotalSeconds, $failedWhy)
+        } else {
+            Write-KdToolLog 'avas' ("finished {0} ({1:N0}s)" -f $tool.Name, $sw.Elapsed.TotalSeconds)
+        }
+    } catch {
+        $failedWhy = $_.Exception.Message
+        Write-Host "  Failed to run $($tool.Name): $failedWhy" -ForegroundColor Red
+        Write-KdToolLog 'avas' ("FAILED {0} after {1:N0}s: {2}" -f $tool.Name, $sw.Elapsed.TotalSeconds, $failedWhy)
+    }
+    Complete-KdTranscript $ts
+
+    Write-Host ''
+    if ($failedWhy) { Write-Host "  --- $($tool.Name) reported a failure ($failedWhy) - returning to menu ---" -ForegroundColor Yellow }
+    else            { Write-Host '  --- tool finished, returning to menu ---' -ForegroundColor DarkGray }
 }
